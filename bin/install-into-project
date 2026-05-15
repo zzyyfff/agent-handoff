@@ -46,14 +46,45 @@ fi
 cc_tmp="$(mktemp)"
 trap 'rm -f "$cc_tmp"' EXIT
 
-# Build the entry; ensure exactly one entry whose command equals $cc_hook.
+# Claude Code hook format (per https://code.claude.com/docs/en/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# Each SessionStart entry is a matcher group with its own inner `hooks`
+# array of handlers — same shape as PreToolUse and the Codex hook
+# format. The pre-fix code wrote a flat `{type, command}` directly into
+# SessionStart, which Claude Code rejects at startup with
+# "hooks: Expected array, but received undefined".
+#
+# Migration / idempotency:
+# - Well-formed matcher groups: surgically remove our command from the
+#   inner hooks array; drop the group only if it becomes empty.
+# - Pre-fix flat entries: if ours, drop; if someone else's, wrap into a
+#   valid matcher group so the user's other broken-pre-fix hooks
+#   recover automatically rather than getting silently lost.
+# - Then append our canonical group.
 jq --arg cmd "$cc_hook" '
   . as $orig
   | (.hooks // {}) as $hooks
   | ($hooks.SessionStart // []) as $arr
-  | ($arr | map(select((.command // "") != $cmd))) as $cleaned
+  | ($arr | map(
+      if (.hooks // null) != null then
+        .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+        | select((.hooks | length) > 0)
+      elif (.type and .command) then
+        if .command == $cmd then empty
+        else {"hooks": [.]}
+        end
+      else
+        .
+      end
+    )) as $migrated
   | $orig
-  | .hooks = ($hooks | .SessionStart = ($cleaned + [{"type":"command","command":$cmd}]))
+  | .hooks = ($hooks | .SessionStart = (
+      $migrated + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
 ' "$cc_settings" > "$cc_tmp"
 mv "$cc_tmp" "$cc_settings"
 trap - EXIT

@@ -29,11 +29,22 @@ This appends an entry like the following to the project's
 {
   "hooks": {
     "SessionStart": [
-      {"type": "command", "command": "/abs/path/to/adapters/claude-code/hooks/surface-handoffs.sh"}
+      {
+        "hooks": [
+          {"type": "command", "command": "/abs/path/to/adapters/claude-code/hooks/surface-handoffs.sh"}
+        ]
+      }
     ]
   }
 }
 ```
+
+Each SessionStart entry is a matcher group with its own inner `hooks`
+array — same shape as PreToolUse, PostToolUse, etc. A flat
+`{type, command}` directly in the SessionStart array is rejected by
+Claude Code at startup with `hooks: Expected array, but received
+undefined`. The installer migrates pre-existing flat entries to the
+correct wrapper.
 
 The hook is idempotent: running the installer twice does not duplicate
 the entry.

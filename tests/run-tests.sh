@@ -758,6 +758,50 @@ test_install_into_project_writes_correct_claude_code_format() {
   assert_eq "$valid" "$total" "every SessionStart entry has inner hooks array"
 }
 
+test_install_into_project_wraps_unrelated_flat_claude_code_entries() {
+  # A pre-fix install that targeted an unrelated tool may have left a
+  # flat {type,command} entry that wasn't ours. Claude Code rejects the
+  # whole file when any flat entry exists, so the user's other hook
+  # was broken anyway. The installer should migrate it to a valid
+  # wrapper rather than silently dropping it — the user gets a working
+  # config back rather than a half-deleted one.
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project/.claude"
+  local our_cmd
+  our_cmd="$(cd "$repo_root" && pwd -P)/adapters/claude-code/hooks/surface-handoffs.sh"
+  cat > "$project/.claude/settings.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"type": "command", "command": "$our_cmd"},
+      {"type": "command", "command": "/usr/local/bin/unrelated-flat"}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  # No flat entries should remain.
+  local flat
+  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' \
+              "$project/.claude/settings.json")"
+  assert_eq "$flat" "0" "no flat entries remain"
+  # The unrelated entry must have been wrapped, not dropped.
+  local wrapped
+  wrapped="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                  | select(.command == "/usr/local/bin/unrelated-flat")]
+                | length' "$project/.claude/settings.json")"
+  assert_eq "$wrapped" "1" "unrelated flat entry migrated into a matcher group"
+  # Our canonical entry present exactly once.
+  local our_count
+  our_count="$(jq --arg c "$our_cmd" '[.hooks.SessionStart[]?.hooks[]?
+                                       | select(.command == $c)] | length' \
+              "$project/.claude/settings.json")"
+  assert_eq "$our_count" "1" "our entry present exactly once"
+}
+
 test_install_into_project_migrates_flat_claude_code_session_start() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '   skipping: jq not available\n' >&2; return 0
@@ -928,6 +972,7 @@ tests=(
   test_install_into_project_writes_correct_codex_format
   test_install_into_project_writes_correct_claude_code_format
   test_install_into_project_migrates_flat_claude_code_session_start
+  test_install_into_project_wraps_unrelated_flat_claude_code_entries
   test_install_into_project_is_idempotent
   test_install_into_project_migrates_stale_top_level_session_start
   test_install_into_project_preserves_sibling_hook_in_same_group

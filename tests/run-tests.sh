@@ -20,11 +20,14 @@ pass=0
 fail=0
 failed_names=()
 
+# Assertions fail-fast: they `exit 1` from the test subshell rather than
+# `return 1` from just the assert helper, so a failed assertion mid-test
+# is not masked by a passing assertion later in the same test.
 assert_eq() {
   local actual="$1" expected="$2" msg="${3:-}"
   if [[ "$actual" != "$expected" ]]; then
     printf '   assert_eq failed: %s\n     expected: %q\n     actual:   %q\n' "$msg" "$expected" "$actual" >&2
-    return 1
+    exit 1
   fi
 }
 
@@ -32,7 +35,7 @@ assert_contains() {
   local haystack="$1" needle="$2" msg="${3:-}"
   if [[ "$haystack" != *"$needle"* ]]; then
     printf '   assert_contains failed: %s\n     needle: %q\n     in:     %q\n' "$msg" "$needle" "$haystack" >&2
-    return 1
+    exit 1
   fi
 }
 
@@ -40,7 +43,7 @@ assert_file_exists() {
   local f="$1"
   if [[ ! -e "$f" ]]; then
     printf '   assert_file_exists failed: %s\n' "$f" >&2
-    return 1
+    exit 1
   fi
 }
 
@@ -541,6 +544,146 @@ test_surface_all_skips_preclaimed_file() {
 }
 
 ###############################################################################
+# install-into-project (Codex JSON shape regression)
+###############################################################################
+
+# These tests exercise bin/install-into-project against a fresh fake
+# project dir. They require jq (same as the script itself).
+
+test_install_into_project_writes_correct_codex_format() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local codex_settings="$HOME/.codex/hooks.json"
+  assert_file_exists "$codex_settings"
+  # Must be at hooks.SessionStart[*].hooks[*].command (NOT at top-level
+  # .SessionStart[*].script — the pre-fix shape Codex silently ignored).
+  local count
+  count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
+              | length' "$codex_settings")"
+  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart"
+  # The bad top-level SessionStart key should not exist.
+  local bad
+  bad="$(jq 'has("SessionStart")' "$codex_settings")"
+  assert_eq "$bad" "false" "no top-level SessionStart (Codex ignores it)"
+  # The script field shape should not be present anywhere.
+  local script_field
+  script_field="$(jq '[..|.script? // empty] | length' "$codex_settings")"
+  assert_eq "$script_field" "0" "no .script field anywhere (wrong shape)"
+}
+
+test_install_into_project_is_idempotent() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local cc_count cx_count
+  cc_count="$(jq '[.hooks.SessionStart[]
+                   | select((.command//"") | endswith("surface-handoffs.sh"))]
+                 | length' "$project/.claude/settings.json")"
+  assert_eq "$cc_count" "1" "claude-code: exactly one SessionStart entry after 3 installs"
+  cx_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select((.command//"") | endswith("surface-handoffs.sh"))]
+                 | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_count" "1" "codex-cli: exactly one SessionStart entry after 3 installs"
+}
+
+test_install_into_project_migrates_stale_top_level_session_start() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project" "$HOME/.codex"
+  # Pre-fix install left a top-level SessionStart with `script` field.
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "SessionStart": [
+    {"script": "/stale/old/path"}
+  ]
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local has_top_level
+  has_top_level="$(jq 'has("SessionStart")' "$HOME/.codex/hooks.json")"
+  assert_eq "$has_top_level" "false" "stale top-level SessionStart removed on reinstall"
+}
+
+test_install_into_project_preserves_sibling_hook_in_same_group() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project" "$HOME/.codex"
+  # User has manually combined agent-handoff with another hook in ONE
+  # matcher group. Reinstall must surgically remove only our entry and
+  # keep the sibling, not blow away the entire group.
+  local our_cmd
+  our_cmd="$(cd "$repo_root" && pwd -P)/adapters/codex-cli/hooks/surface-handoffs.sh"
+  cat > "$HOME/.codex/hooks.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [
+        {"type":"command","command":"/usr/local/bin/sibling-hook"},
+        {"type":"command","command":"$our_cmd"}
+      ]}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local sibling_kept
+  sibling_kept="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                       | select(.command == "/usr/local/bin/sibling-hook")]
+                     | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$sibling_kept" "1" "sibling hook preserved after surgical removal"
+  local our_count
+  our_count="$(jq --arg c "$our_cmd" '[.hooks.SessionStart[]?.hooks[]?
+                                       | select(.command == $c)] | length' \
+              "$HOME/.codex/hooks.json")"
+  assert_eq "$our_count" "1" "our entry present exactly once after reinstall"
+}
+
+test_install_into_project_preserves_other_hooks() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  mkdir -p "$HOME/.codex"
+  # Seed an existing unrelated hook the install must preserve.
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/existing-hook"}]}
+    ],
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/usr/local/bin/existing-session-hook"}]}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local preserved
+  preserved="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.codex/hooks.json")"
+  assert_eq "$preserved" "/usr/local/bin/existing-hook" "PreToolUse preserved"
+  local kept_session
+  kept_session="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                       | select(.command == "/usr/local/bin/existing-session-hook")]
+                     | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$kept_session" "1" "existing SessionStart entry kept alongside agent-handoff"
+}
+
+###############################################################################
 # discovery + run
 ###############################################################################
 
@@ -578,6 +721,11 @@ tests=(
   test_surface_all_strips_ansi_in_body
   test_surface_all_strips_ansi_in_field
   test_surface_all_skips_preclaimed_file
+  test_install_into_project_writes_correct_codex_format
+  test_install_into_project_is_idempotent
+  test_install_into_project_migrates_stale_top_level_session_start
+  test_install_into_project_preserves_sibling_hook_in_same_group
+  test_install_into_project_preserves_other_hooks
 )
 
 printf '=== agent-handoff tests ===\n'

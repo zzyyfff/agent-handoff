@@ -78,15 +78,34 @@ fi
 cx_tmp="$(mktemp)"
 trap 'rm -f "$cx_tmp"' EXIT
 
-# Codex hook format (May 2026): { "SessionStart": [ { "script": "..." } ] }
-# Wired similarly to Claude Code: remove any prior entry pointing at the
-# same script, then append ours.
-jq --arg script "$cx_hook" '
-  . as $orig
-  | (.SessionStart // []) as $arr
-  | ($arr | map(select((.script // "") != $script))) as $cleaned
-  | $orig
-  | .SessionStart = ($cleaned + [{"script":$script}])
+# Codex CLI hook format (v0.130+, verified against
+# https://developers.openai.com/codex/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# The outer SessionStart array is matcher-groups; each group has its
+# own inner `hooks` array of handlers. We remove any matcher-group whose
+# inner hooks include our command (idempotency across reinstalls), then
+# append a fresh group containing just ours.
+jq --arg cmd "$cx_hook" '
+  # 1. Strip any stale top-level `SessionStart` left over from the
+  #    pre-fix install (wrong shape that Codex silently ignored).
+  del(.SessionStart)
+  # 2. Surgically strip our command from existing matcher groups.
+  #    Preserves sibling hooks the user may have placed alongside ours;
+  #    drops a matcher group only if it becomes empty after removal.
+  | (.hooks // {}) as $hooks
+  | ($hooks.SessionStart // []) as $arr
+  | ($arr | map(
+      .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+      | select((.hooks | length) > 0)
+    )) as $pruned
+  # 3. Append the canonical agent-handoff group.
+  | .hooks = ($hooks | .SessionStart = (
+      $pruned + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
 ' "$cx_settings" > "$cx_tmp"
 mv "$cx_tmp" "$cx_settings"
 trap - EXIT

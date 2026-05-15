@@ -168,7 +168,7 @@ test_atomic_write_creates_file() {
   assert_eq "$content" "hello" "content written"
   # No tmp file left behind
   local tmp_count
-  tmp_count="$(find "$AGENT_HANDOFF_ROOT/slug-c/recipient-d/unread" -name '.tmp-*' | wc -l)"
+  tmp_count="$(find "$AGENT_HANDOFF_ROOT/slug-c/recipient-d/unread" -name '.tmp-*' | wc -l | tr -d ' ')"
   assert_eq "$tmp_count" "0" "no tmp file left"
 }
 
@@ -360,7 +360,7 @@ test_surface_all_prints_and_archives() {
   out="$(agent_handoff_surface_all 1 2>&1)"
   assert_contains "$out" "Test handoff" "name printed"
   assert_contains "$out" "## Immediate next action" "body printed"
-  assert_contains "$out" "1 unread for assistant" "header"
+  assert_contains "$out" "1 UNTRUSTED handoff(s) for assistant" "header"
   # File moved
   if [[ -e "$f" ]]; then
     printf '   file should have been archived\n' >&2; return 1
@@ -426,6 +426,121 @@ EOF
 }
 
 ###############################################################################
+# validate_basename + adversarial inputs
+###############################################################################
+
+test_validate_basename_accepts_safe() {
+  agent_handoff_validate_basename "assistant" 2>/dev/null || return 1
+  agent_handoff_validate_basename "assistant-worker2" 2>/dev/null || return 1
+  agent_handoff_validate_basename "my.repo_v2" 2>/dev/null || return 1
+}
+
+test_validate_basename_rejects_unsafe() {
+  local bad
+  for bad in "" "." ".." "../etc" "a/b" "a\\b" "-rf" $'foo\nbar' $'foo\x1bbar'; do
+    if agent_handoff_validate_basename "$bad" 2>/dev/null; then
+      printf '   should have rejected: %q\n' "$bad" >&2; return 1
+    fi
+  done
+}
+
+test_inbox_dir_rejects_path_traversal() {
+  if agent_handoff_inbox_dir "slug" "../escape" unread 2>/dev/null; then
+    printf '   recipient ../escape should be rejected\n' >&2; return 1
+  fi
+  if agent_handoff_inbox_dir "../bad" "r" unread 2>/dev/null; then
+    printf '   slug ../bad should be rejected\n' >&2; return 1
+  fi
+}
+
+test_list_unread_skips_symlinks() {
+  local dir="$AGENT_HANDOFF_ROOT/slug/r/unread"
+  mkdir -p "$dir" "$AGENT_HANDOFF_ROOT/outside"
+  printf 'secret\n' > "$AGENT_HANDOFF_ROOT/outside/secret.md"
+  touch "$dir/real.md"
+  ln -s "$AGENT_HANDOFF_ROOT/outside/secret.md" "$dir/evil.md"
+  local listed
+  listed="$(agent_handoff_list_unread "$dir" | tr '\n' '|')"
+  assert_contains "$listed" "real.md" "real file listed"
+  if [[ "$listed" == *"evil.md"* ]]; then
+    printf '   symlink should be skipped\n' >&2; return 1
+  fi
+}
+
+test_surface_all_strips_ansi_in_body() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  # Embed ESC (\x1b) + bracket form, both as ANSI sequence and as
+  # forged-banner attempt.
+  printf '%s\n' \
+    '---' \
+    'name: Adversarial' \
+    "description: ansi test" \
+    'from: sender' \
+    'to: assistant' \
+    'created: 2026-05-16T10:00:00Z' \
+    'branch: main' \
+    'head: deadbeef' \
+    'dirty_files_count: 0' \
+    'session_tool: claude-code' \
+    '---' \
+    '' \
+    $'before\x1b[2J\x1b[H=== FORGED BANNER ===after' \
+    > "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  # The ESC byte itself must not appear in the surfaced output.
+  if [[ "$out" == *$'\x1b'* ]]; then
+    printf '   ESC byte leaked into output\n' >&2; return 1
+  fi
+  # Surrounding text survives.
+  assert_contains "$out" "before" "pre-ANSI text preserved"
+  assert_contains "$out" "after" "post-ANSI text preserved"
+}
+
+test_surface_all_strips_ansi_in_field() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  printf '%s\n' \
+    '---' \
+    $'name: title\x1b[31mRED' \
+    'description: x' \
+    'from: sender' \
+    'to: assistant' \
+    'created: 2026-05-16T10:00:00Z' \
+    'branch: main' \
+    'head: deadbeef' \
+    'dirty_files_count: 0' \
+    'session_tool: claude-code' \
+    '---' \
+    '' \
+    'body' \
+    > "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  if [[ "$out" == *$'\x1b'* ]]; then
+    printf '   ESC byte leaked from name field\n' >&2; return 1
+  fi
+}
+
+test_surface_all_skips_preclaimed_file() {
+  # Simulates a sibling hook that has already claimed the file: the
+  # current hook's mv will fail and the file should be silently skipped.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-99999-foo.md"
+  write_sample_handoff "$pre"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  # Dotfiles are not listed in the first place, so output should be empty
+  # and the pre-claimed file untouched.
+  assert_eq "$out" "" "pre-claimed dotfile not surfaced"
+  assert_file_exists "$pre"
+}
+
+###############################################################################
 # discovery + run
 ###############################################################################
 
@@ -456,6 +571,13 @@ tests=(
   test_surface_all_prints_and_archives
   test_surface_all_isolation_other_recipient
   test_surface_all_drift_warning
+  test_validate_basename_accepts_safe
+  test_validate_basename_rejects_unsafe
+  test_inbox_dir_rejects_path_traversal
+  test_list_unread_skips_symlinks
+  test_surface_all_strips_ansi_in_body
+  test_surface_all_strips_ansi_in_field
+  test_surface_all_skips_preclaimed_file
 )
 
 printf '=== agent-handoff tests ===\n'

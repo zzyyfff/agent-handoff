@@ -64,7 +64,11 @@ The slug strips worktree suffixes (`-worker`, `-worker<N>`, `-dev-preview`,
 
 ### 2. Parse args
 
-- `TO` ← `--to` value, default `$ME`.
+- `TO` ← `--to` value, default `$ME`. Validate via
+  `agent_handoff_validate_basename "$TO"` from `lib/slug.sh`; abort with
+  a clear error if the value contains `/`, `..`, control chars, or
+  anything outside `[A-Za-z0-9._-]`. The library defends in depth, but
+  the writer should fail fast on bad user input.
 - `TOPIC` ← `--topic` value, optional. Validate against `[a-z0-9-]+`.
 - Body source: `--file <path>` | stdin | live-from-conversation.
 

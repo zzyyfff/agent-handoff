@@ -59,6 +59,42 @@ agent_handoff_worktree_basename() {
   basename -- "$abs"
 }
 
+# agent_handoff_validate_basename <basename>
+#
+# Returns 0 if <basename> is safe to use as a path segment (worktree
+# basename, recipient key). Returns 1 with an error to stderr otherwise.
+# Rejects: empty, '.', '..', any '/', any backslash, leading '-', any
+# byte outside printable ASCII (control chars, NUL).
+#
+# Use defensively before joining a basename into an inbox path, and at
+# the writer side before accepting a `--to` value.
+agent_handoff_validate_basename() {
+  local b="${1:-}"
+  if [[ -z "$b" ]]; then
+    printf 'agent-handoff: empty basename rejected\n' >&2
+    return 1
+  fi
+  if [[ "$b" == "." || "$b" == ".." ]]; then
+    printf 'agent-handoff: basename %q rejected (path component)\n' "$b" >&2
+    return 1
+  fi
+  if [[ "$b" == */* || "$b" == *\\* ]]; then
+    printf 'agent-handoff: basename %q rejected (contains path separator)\n' "$b" >&2
+    return 1
+  fi
+  if [[ "$b" == -* ]]; then
+    printf 'agent-handoff: basename %q rejected (leading dash)\n' "$b" >&2
+    return 1
+  fi
+  # Positive whitelist: letters, digits, '.', '_', '-'. No spaces, no
+  # control chars, no shell/path metacharacters, locale-independent.
+  if [[ ! "$b" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf 'agent-handoff: basename rejected (allowed: A-Za-z0-9._-)\n' >&2
+    return 1
+  fi
+  return 0
+}
+
 # agent_handoff_resolve_root [explicit-root]
 #
 # Returns an absolute worktree root. Order of resolution:

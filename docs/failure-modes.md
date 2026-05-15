@@ -119,3 +119,49 @@ A handoff can contain instructions the receiving agent might follow
 The user-facing AGENTS.md / CLAUDE.md text instructs the agent
 accordingly. The receiver hook does not execute handoff content; it
 only prints it.
+
+The hook also frames surfaced content as `UNTRUSTED handoff(s)` in the
+banner and strips C0 control bytes from both metadata fields and the
+body before printing. This neutralises ANSI escape sequences a malicious
+sender might embed to clear the terminal or forge banner text.
+
+## Concurrent SessionStart hooks
+
+**Symptom.** Two terminal sessions in the same worktree start at nearly
+the same instant; both fire the SessionStart hook.
+
+**Behaviour.** Each unread file is claimed via an atomic rename to
+`unread/.claim-<pid>-<basename>` before being surfaced. The first hook
+to rename a given file wins; the loser's `mv` fails and that file is
+silently skipped by the losing hook (the winner still surfaces it
+exactly once). `list_unread` skips dotfiles, so a parallel hook does
+not re-list a claimed file.
+
+**Stuck claim.** If a hook is killed (`SIGKILL`, panic) between claiming
+a file and finishing the archive, the file remains as
+`unread/.claim-<dead-pid>-<basename>` and is invisible to subsequent
+hooks. Recovery is manual: `mv unread/.claim-<pid>-<base> unread/<base>`
+or move it to `read/<base>` if already internalised.
+
+## Recipient path traversal
+
+**Symptom.** A handoff written with `--to ../../../etc/passwd` or a
+recipient containing control bytes.
+
+**This is prevented by design.** `agent_handoff_validate_basename` (in
+`lib/slug.sh`) enforces a positive whitelist `[A-Za-z0-9._-]+` and
+rejects `.`, `..`, leading dashes, and any other byte. The writer skill
+validates the user-supplied `--to`; the library re-validates inside
+`agent_handoff_inbox_dir` so a buggy adapter cannot bypass the check.
+
+## Hostile inbox entries (symlinks, FIFOs)
+
+**Symptom.** Someone with write access to your `~/.agent-handoffs/`
+directory creates a symlink `unread/x.md → /etc/passwd` or a FIFO
+named `x.md`.
+
+**Behaviour.** `agent_handoff_list_unread` only emits regular,
+non-symlink files. Symlinks, FIFOs, sockets, and devices are silently
+skipped — a symlink cannot make the hook surface content from outside
+the inbox, and a FIFO cannot stall the hook when awk later opens the
+file.

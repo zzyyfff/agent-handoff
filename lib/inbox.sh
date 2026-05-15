@@ -64,19 +64,66 @@ agent_handoff_filename() {
   fi
 }
 
+# agent_handoff_safe_rename <src> <dest>
+#
+# Atomically moves <src> to <dest>, retrying with a `-<hex>` uniqueness
+# suffix (inserted before `.md` if present) up to 5 times on collision.
+# Prints the actual landing path to stdout. Returns 1 if all 6 attempts
+# collide.
+#
+# Implementation note: `ln` (hard-link) atomically fails if the target
+# exists; `mv -n` is silent-on-conflict on BSD, which makes detection
+# brittle. We hard-link to the candidate, then remove src — equivalent
+# to mv for files on the same filesystem (which our case always is,
+# since src and dest share a parent dir).
+agent_handoff_safe_rename() {
+  local src="$1" dest="$2"
+  local dir base stem ext
+  dir="$(dirname -- "$dest")"
+  base="$(basename -- "$dest")"
+  if [[ "$base" == *.md ]]; then
+    stem="${base%.md}"
+    ext=".md"
+  else
+    stem="$base"
+    ext=""
+  fi
+  local attempt candidate hex
+  for attempt in 0 1 2 3 4 5; do
+    if [[ $attempt -eq 0 ]]; then
+      candidate="$dest"
+    else
+      hex="$(printf '%04x%01x' "$RANDOM" "$((RANDOM % 16))")"
+      candidate="$dir/${stem}-${hex}${ext}"
+    fi
+    if ln -- "$src" "$candidate" 2>/dev/null; then
+      rm -f -- "$src"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  printf 'agent-handoff: safe_rename failed after 6 collision retries at %s\n' \
+    "$dest" >&2
+  return 1
+}
+
 # agent_handoff_atomic_write <destination> < stdin
 #
 # Reads stdin, writes to a .tmp- sibling in the same directory, then
-# renames. Mode 0600.
+# atomically links into place via agent_handoff_safe_rename. Mode 0600.
+# Prints the final landing path to stdout — may differ from
+# <destination> if a collision forced a uniqueness suffix.
 agent_handoff_atomic_write() {
   local dest="$1"
-  local dir base tmp
+  local dir tmp
   dir="$(dirname -- "$dest")"
-  base="$(basename -- "$dest")"
-  tmp="$dir/.tmp-$$-$(date +%s)-$RANDOM-$base"
+  tmp="$dir/.tmp-$$-$(date +%s)-$RANDOM-$(basename -- "$dest")"
   umask 077
   cat > "$tmp"
-  mv -- "$tmp" "$dest"
+  if ! agent_handoff_safe_rename "$tmp" "$dest"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 # agent_handoff_read_frontmatter_field <file> <field>
@@ -163,23 +210,41 @@ agent_handoff_list_unread() {
 # agent_handoff_archive <file> <read-dir>
 #
 # Moves <file> into <read-dir>. Caller is responsible for stamping
-# received_at first.
+# received_at first. Uses agent_handoff_safe_rename so re-archiving the
+# same basename (e.g. after manual recovery of a stale claim) does not
+# silently overwrite. Prints the actual landing path.
 agent_handoff_archive() {
   local src="$1" read_dir="$2"
   mkdir -p -- "$read_dir"
-  mv -- "$src" "$read_dir/$(basename -- "$src")"
+  agent_handoff_safe_rename "$src" "$read_dir/$(basename -- "$src")"
 }
 
 # agent_handoff_print_body <file>
 #
 # Prints everything after the closing frontmatter '---' to stdout.
+# If the frontmatter has no closing '---' (truncated writer, hand-edit
+# gone wrong, BOM-prefixed file, empty file), emits a warning and the
+# entire raw file content per spec/file-format.md ("Receiver hooks
+# should surface malformed handoffs verbatim with a warning, rather
+# than dropping them silently").
 agent_handoff_print_body() {
-  awk '
-    BEGIN { in_fm = 0; past_fm = 0 }
+  local file="$1"
+  # Detect a properly-closed frontmatter block. awk exits 0 if found.
+  if awk '
     NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; next }
-    in_fm && /^---[[:space:]]*$/ { in_fm = 0; past_fm = 1; next }
-    past_fm { print }
-  ' "$1"
+    in_fm && /^---[[:space:]]*$/ { found = 1; exit }
+    END { exit !found }
+  ' "$file"; then
+    awk '
+      BEGIN { in_fm = 0; past_fm = 0 }
+      NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; next }
+      in_fm && /^---[[:space:]]*$/ { in_fm = 0; past_fm = 1; next }
+      past_fm { print }
+    ' "$file"
+    return 0
+  fi
+  printf '!! WARNING: malformed handoff (frontmatter not closed) — raw content follows\n\n'
+  cat -- "$file"
 }
 
 # agent_handoff_strip_control_chars
@@ -302,8 +367,10 @@ agent_handoff_surface_all() {
 
       agent_handoff_stamp_received_at "$cf" "$now"
       # Archive: restore the original (non-dotfile) basename in read/.
+      # safe_rename handles the rare case where read/<orig> already
+      # exists (manual recovery / re-archive) by appending -<hex>.
       mkdir -p -- "$read_dir"
-      mv -- "$cf" "$read_dir/$orig"
+      agent_handoff_safe_rename "$cf" "$read_dir/$orig" >/dev/null
     done
     printf '\n=== %d handoff(s) archived to read/ ===\n\n' "${#claimed[@]}"
   } >&"$out_fd"

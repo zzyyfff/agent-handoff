@@ -544,6 +544,113 @@ test_surface_all_skips_preclaimed_file() {
 }
 
 ###############################################################################
+# P2 #2 — collision handling (atomic_write / archive return unique paths)
+###############################################################################
+
+test_atomic_write_returns_landing_path() {
+  agent_handoff_ensure_inbox slug-aw recip
+  local dest="$AGENT_HANDOFF_ROOT/slug-aw/recip/unread/x.md"
+  local got
+  got="$(printf 'first\n' | agent_handoff_atomic_write "$dest")"
+  assert_eq "$got" "$dest" "atomic_write returns dest path on first write"
+}
+
+test_atomic_write_collision_appends_hex_suffix() {
+  agent_handoff_ensure_inbox slug-aw recip
+  local dest="$AGENT_HANDOFF_ROOT/slug-aw/recip/unread/clash.md"
+  local first second
+  first="$(printf 'first\n' | agent_handoff_atomic_write "$dest")"
+  second="$(printf 'second\n' | agent_handoff_atomic_write "$dest")"
+  assert_eq "$first" "$dest" "first write lands at exact dest"
+  # Second must differ and must match clash-<5hex>.md.
+  if [[ "$second" == "$dest" ]]; then
+    printf '   second write should not equal first\n' >&2; exit 1
+  fi
+  if [[ ! "$second" =~ /clash-[0-9a-f]{5}\.md$ ]]; then
+    printf '   expected /clash-XXXXX.md, got %s\n' "$second" >&2; exit 1
+  fi
+  # Both files exist and contents differ.
+  assert_eq "$(cat "$first")" "first" "first content intact"
+  assert_eq "$(cat "$second")" "second" "second content intact"
+}
+
+test_atomic_write_does_not_overwrite_via_helper() {
+  # Direct collision against an existing non-handoff file should still
+  # be honored (suffix appended, original untouched).
+  agent_handoff_ensure_inbox slug-aw recip
+  local dest="$AGENT_HANDOFF_ROOT/slug-aw/recip/unread/precious.md"
+  printf 'do-not-clobber\n' > "$dest"
+  local got
+  got="$(printf 'newcomer\n' | agent_handoff_atomic_write "$dest")"
+  assert_eq "$(cat "$dest")" "do-not-clobber" "original file untouched"
+  assert_eq "$(cat "$got")" "newcomer" "newcomer landed at suffixed path"
+}
+
+test_archive_collision_appends_hex_suffix() {
+  agent_handoff_ensure_inbox slug-arch me
+  local read_dir="$AGENT_HANDOFF_ROOT/slug-arch/me/read"
+  mkdir -p "$read_dir"
+  printf 'existing archived\n' > "$read_dir/dup.md"
+  local src="$AGENT_HANDOFF_ROOT/slug-arch/me/unread/dup.md"
+  write_sample_handoff "$src"
+  local got
+  got="$(agent_handoff_archive "$src" "$read_dir")"
+  if [[ "$got" == "$read_dir/dup.md" ]]; then
+    printf '   archive should not have overwritten existing dup.md\n' >&2; exit 1
+  fi
+  if [[ ! "$got" =~ /dup-[0-9a-f]{5}\.md$ ]]; then
+    printf '   expected /dup-XXXXX.md, got %s\n' "$got" >&2; exit 1
+  fi
+  assert_eq "$(cat "$read_dir/dup.md")" "existing archived" "existing untouched"
+}
+
+###############################################################################
+# P2 #3 — malformed handoffs surfaced verbatim with warning
+###############################################################################
+
+test_print_body_warns_and_dumps_when_frontmatter_unclosed() {
+  local f="$AGENT_HANDOFF_ROOT/malformed.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  cat > "$f" <<'EOF'
+---
+name: truncated
+description: writer crashed mid-write
+EOF
+  local out
+  out="$(agent_handoff_print_body "$f")"
+  assert_contains "$out" "WARNING: malformed handoff" "warning surfaced"
+  assert_contains "$out" "name: truncated" "raw frontmatter dumped"
+  assert_contains "$out" "writer crashed mid-write" "raw body dumped"
+}
+
+test_print_body_warns_on_empty_file() {
+  local f="$AGENT_HANDOFF_ROOT/empty.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  : > "$f"
+  local out
+  out="$(agent_handoff_print_body "$f")"
+  assert_contains "$out" "WARNING: malformed handoff" "warning surfaced on empty"
+}
+
+test_surface_all_surfaces_malformed_with_warning() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  cat > "$f" <<'EOF'
+---
+name: missing close
+description: no closing dashes
+EOF
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  assert_contains "$out" "WARNING: malformed handoff" "warning shown via surface_all"
+  assert_contains "$out" "name: missing close" "raw content shown via surface_all"
+  if [[ -e "$f" ]]; then
+    printf '   malformed file should still be archived after surfacing\n' >&2; exit 1
+  fi
+}
+
+###############################################################################
 # install-into-project (Codex JSON shape regression)
 ###############################################################################
 
@@ -721,6 +828,13 @@ tests=(
   test_surface_all_strips_ansi_in_body
   test_surface_all_strips_ansi_in_field
   test_surface_all_skips_preclaimed_file
+  test_atomic_write_returns_landing_path
+  test_atomic_write_collision_appends_hex_suffix
+  test_atomic_write_does_not_overwrite_via_helper
+  test_archive_collision_appends_hex_suffix
+  test_print_body_warns_and_dumps_when_frontmatter_unclosed
+  test_print_body_warns_on_empty_file
+  test_surface_all_surfaces_malformed_with_warning
   test_install_into_project_writes_correct_codex_format
   test_install_into_project_is_idempotent
   test_install_into_project_migrates_stale_top_level_session_start

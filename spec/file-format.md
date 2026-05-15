@@ -7,7 +7,7 @@ one agent tool in required positions.
 ## Filename
 
 ```
-<YYYYMMDD>T<HHMMSS>Z-from-<sender-basename>[-<topic-slug>].md
+<YYYYMMDD>T<HHMMSS>Z-from-<sender-basename>[-<topic-slug>][-<hex>].md
 ```
 
 - Timestamps are ISO-8601 UTC, no separators in the date/time portions so
@@ -15,6 +15,13 @@ one agent tool in required positions.
 - `<sender-basename>` is `basename(git rev-parse --show-toplevel)` of the
   writing worktree.
 - `<topic-slug>` is optional; when present it must be `[a-z0-9-]+`.
+- `<hex>` is an optional uniqueness suffix (5 hex characters) appended
+  by the writer's atomic-write helper when the otherwise-collision-free
+  name (timestamp + sender + topic, all second-precise) is already in
+  use in the destination directory. Reading code MUST NOT rely on the
+  suffix's presence or absence; it exists only to make two same-second
+  writes from the same sender/topic deterministic instead of one
+  silently overwriting the other.
 
 ## Frontmatter
 

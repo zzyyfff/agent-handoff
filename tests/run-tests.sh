@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+# tests/run-tests.sh — pure-bash test harness for agent-handoff.
+#
+# Usage:   tests/run-tests.sh
+# Exit:    0 on success, 1 on any failure.
+#
+# Each test is a function prefixed `test_`. The harness discovers and runs
+# them in declaration order, prints PASS/FAIL with a short message, and
+# tallies at the end.
+
+set -uo pipefail
+
+repo_root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=../lib/slug.sh
+source "$repo_root/lib/slug.sh"
+# shellcheck source=../lib/inbox.sh
+source "$repo_root/lib/inbox.sh"
+
+pass=0
+fail=0
+failed_names=()
+
+assert_eq() {
+  local actual="$1" expected="$2" msg="${3:-}"
+  if [[ "$actual" != "$expected" ]]; then
+    printf '   assert_eq failed: %s\n     expected: %q\n     actual:   %q\n' "$msg" "$expected" "$actual" >&2
+    return 1
+  fi
+}
+
+assert_contains() {
+  local haystack="$1" needle="$2" msg="${3:-}"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    printf '   assert_contains failed: %s\n     needle: %q\n     in:     %q\n' "$msg" "$needle" "$haystack" >&2
+    return 1
+  fi
+}
+
+assert_file_exists() {
+  local f="$1"
+  if [[ ! -e "$f" ]]; then
+    printf '   assert_file_exists failed: %s\n' "$f" >&2
+    return 1
+  fi
+}
+
+# Each test runs in a fresh subshell with its own tmp dir + AGENT_HANDOFF_ROOT.
+run_test() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  if (
+    export AGENT_HANDOFF_ROOT="$tmp/handoffs"
+    export HOME="$tmp/home"
+    mkdir -p "$HOME"
+    set -uo pipefail
+    "$name"
+  ); then
+    printf '  PASS  %s\n' "$name"
+    pass=$((pass + 1))
+  else
+    printf '  FAIL  %s\n' "$name"
+    fail=$((fail + 1))
+    failed_names+=("$name")
+  fi
+  rm -rf "$tmp"
+  trap - EXIT
+}
+
+###############################################################################
+# slug derivation
+###############################################################################
+
+test_slug_plain() {
+  local got
+  got="$(agent_handoff_canonical_slug /Users/jonathan/Developer/personal/assistant)"
+  assert_eq "$got" "Users-jonathan-Developer-personal-assistant" "plain worktree"
+}
+
+test_slug_worker_suffix() {
+  local got
+  got="$(agent_handoff_canonical_slug /Users/jonathan/Developer/personal/assistant-worker)"
+  assert_eq "$got" "Users-jonathan-Developer-personal-assistant" "-worker suffix stripped"
+}
+
+test_slug_worker_numbered() {
+  local got
+  got="$(agent_handoff_canonical_slug /Users/jonathan/Developer/personal/assistant-worker2)"
+  assert_eq "$got" "Users-jonathan-Developer-personal-assistant" "-worker2 stripped"
+}
+
+test_slug_dev_preview() {
+  local got
+  got="$(agent_handoff_canonical_slug /home/alice/work/billing-dev-preview)"
+  assert_eq "$got" "home-alice-work-billing" "-dev-preview stripped"
+}
+
+test_slug_wt_suffix() {
+  local got
+  got="$(agent_handoff_canonical_slug /tmp/proj/app-wt3)"
+  assert_eq "$got" "tmp-proj-app" "-wt3 stripped"
+}
+
+test_slug_no_match_left_alone() {
+  local got
+  got="$(agent_handoff_canonical_slug /tmp/proj/regular-name)"
+  assert_eq "$got" "tmp-proj-regular-name" "non-suffix name unchanged"
+}
+
+test_basename_no_strip() {
+  local got
+  got="$(agent_handoff_worktree_basename /Users/jonathan/Developer/personal/assistant-worker)"
+  assert_eq "$got" "assistant-worker" "basename preserves suffix"
+}
+
+###############################################################################
+# inbox helpers
+###############################################################################
+
+test_inbox_dir_path() {
+  local got
+  got="$(agent_handoff_inbox_dir slug-x recipient-y unread)"
+  assert_eq "$got" "$AGENT_HANDOFF_ROOT/slug-x/recipient-y/unread" "inbox dir composed"
+}
+
+test_ensure_inbox_creates_dirs() {
+  agent_handoff_ensure_inbox slug-a recipient-b
+  assert_file_exists "$AGENT_HANDOFF_ROOT/slug-a/recipient-b/unread"
+  assert_file_exists "$AGENT_HANDOFF_ROOT/slug-a/recipient-b/read"
+  local mode
+  mode="$(stat -c %a "$AGENT_HANDOFF_ROOT/slug-a/recipient-b" 2>/dev/null || stat -f %Lp "$AGENT_HANDOFF_ROOT/slug-a/recipient-b")"
+  assert_eq "$mode" "700" "inbox mode 0700"
+}
+
+test_iso_now_format() {
+  local got
+  got="$(agent_handoff_iso_now)"
+  [[ "$got" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    || { printf '   iso_now bad: %s\n' "$got" >&2; return 1; }
+}
+
+test_filename_with_topic() {
+  local got
+  # Stub date for deterministic output by overriding the function.
+  agent_handoff_timestamp_compact() { printf '20260516T142300Z'; }
+  got="$(agent_handoff_filename assistant my-topic)"
+  unset -f agent_handoff_timestamp_compact
+  assert_eq "$got" "20260516T142300Z-from-assistant-my-topic.md" "filename with topic"
+}
+
+test_filename_without_topic() {
+  agent_handoff_timestamp_compact() { printf '20260516T142300Z'; }
+  local got
+  got="$(agent_handoff_filename assistant)"
+  unset -f agent_handoff_timestamp_compact
+  assert_eq "$got" "20260516T142300Z-from-assistant.md" "filename without topic"
+}
+
+test_atomic_write_creates_file() {
+  agent_handoff_ensure_inbox slug-c recipient-d
+  local dest="$AGENT_HANDOFF_ROOT/slug-c/recipient-d/unread/test.md"
+  printf 'hello\n' | agent_handoff_atomic_write "$dest"
+  assert_file_exists "$dest"
+  local content
+  content="$(cat "$dest")"
+  assert_eq "$content" "hello" "content written"
+  # No tmp file left behind
+  local tmp_count
+  tmp_count="$(find "$AGENT_HANDOFF_ROOT/slug-c/recipient-d/unread" -name '.tmp-*' | wc -l | tr -d ' ')"
+  assert_eq "$tmp_count" "0" "no tmp file left"
+}
+
+###############################################################################
+# frontmatter parsing
+###############################################################################
+
+write_sample_handoff() {
+  local dest="$1"
+  cat > "$dest" <<'EOF'
+---
+name: Test handoff
+description: A test
+from: sender
+to: receiver
+created: 2026-05-15T10:00:00Z
+branch: main
+head: abc1234
+dirty_files_count: 0
+session_tool: claude-code
+---
+
+# Handoff — Test
+
+## Immediate next action
+Just a test body.
+
+## What NOT to do on resume
+Don't re-test.
+EOF
+}
+
+test_read_frontmatter_field_name() {
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  write_sample_handoff "$f"
+  local got
+  got="$(agent_handoff_read_frontmatter_field "$f" name)"
+  assert_eq "$got" "Test handoff" "frontmatter name"
+}
+
+test_read_frontmatter_field_branch() {
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  write_sample_handoff "$f"
+  local got
+  got="$(agent_handoff_read_frontmatter_field "$f" branch)"
+  assert_eq "$got" "main" "frontmatter branch"
+}
+
+test_read_frontmatter_field_missing() {
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  write_sample_handoff "$f"
+  if agent_handoff_read_frontmatter_field "$f" nope >/dev/null 2>&1; then
+    printf '   expected failure for missing field\n' >&2
+    return 1
+  fi
+}
+
+test_read_frontmatter_does_not_match_body() {
+  # A line "name: ..." appearing in the body must not be returned.
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  cat > "$f" <<'EOF'
+---
+name: Real name
+created: 2026-05-15T10:00:00Z
+---
+
+# Body
+name: Fake name in body
+EOF
+  local got
+  got="$(agent_handoff_read_frontmatter_field "$f" name)"
+  assert_eq "$got" "Real name" "frontmatter parser stops at closing ---"
+}
+
+###############################################################################
+# received_at stamping
+###############################################################################
+
+test_stamp_received_at_inserts() {
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  write_sample_handoff "$f"
+  agent_handoff_stamp_received_at "$f" "2026-05-16T14:23:00Z"
+  local got
+  got="$(agent_handoff_read_frontmatter_field "$f" received_at)"
+  assert_eq "$got" "2026-05-16T14:23:00Z" "received_at inserted"
+  # Body must be intact
+  local body
+  body="$(agent_handoff_print_body "$f")"
+  assert_contains "$body" "## Immediate next action" "body preserved"
+}
+
+test_stamp_received_at_replaces_existing() {
+  local f="$AGENT_HANDOFF_ROOT/sample.md"
+  mkdir -p "$AGENT_HANDOFF_ROOT"
+  cat > "$f" <<'EOF'
+---
+name: Test
+received_at: 2026-01-01T00:00:00Z
+created: 2026-05-15T10:00:00Z
+---
+
+body
+EOF
+  agent_handoff_stamp_received_at "$f" "2026-05-16T14:23:00Z"
+  local got
+  got="$(agent_handoff_read_frontmatter_field "$f" received_at)"
+  assert_eq "$got" "2026-05-16T14:23:00Z" "received_at replaced not duplicated"
+  # Ensure it appears exactly once
+  local count
+  count="$(grep -c '^received_at:' "$f")"
+  assert_eq "$count" "1" "received_at appears once"
+}
+
+###############################################################################
+# list / archive
+###############################################################################
+
+test_list_unread_skips_dotfiles_and_non_md() {
+  local dir="$AGENT_HANDOFF_ROOT/slug/r/unread"
+  mkdir -p "$dir"
+  touch "$dir/a.md" "$dir/.tmp-xyz" "$dir/notes.txt" "$dir/b.md"
+  local listed
+  listed="$(agent_handoff_list_unread "$dir" | tr '\n' '|')"
+  assert_contains "$listed" "a.md" "a.md listed"
+  assert_contains "$listed" "b.md" "b.md listed"
+  if [[ "$listed" == *".tmp-xyz"* ]]; then
+    printf '   tmp file should be skipped\n' >&2; return 1
+  fi
+  if [[ "$listed" == *"notes.txt"* ]]; then
+    printf '   non-md should be skipped\n' >&2; return 1
+  fi
+}
+
+test_list_unread_missing_dir() {
+  local got
+  got="$(agent_handoff_list_unread "$AGENT_HANDOFF_ROOT/does/not/exist")"
+  assert_eq "$got" "" "missing dir => empty output, no error"
+}
+
+test_archive_moves_file() {
+  agent_handoff_ensure_inbox slug-arch me
+  local f="$AGENT_HANDOFF_ROOT/slug-arch/me/unread/x.md"
+  write_sample_handoff "$f"
+  local read_dir="$AGENT_HANDOFF_ROOT/slug-arch/me/read"
+  agent_handoff_archive "$f" "$read_dir"
+  if [[ -e "$f" ]]; then
+    printf '   source should be gone\n' >&2; return 1
+  fi
+  assert_file_exists "$read_dir/x.md"
+}
+
+###############################################################################
+# end-to-end: surface_all
+###############################################################################
+
+# To exercise agent_handoff_surface_all in isolation from a real git repo,
+# we stub agent_handoff_resolve_root, agent_handoff_worktree_basename, and
+# agent_handoff_canonical_slug after sourcing.
+
+setup_fake_worktree() {
+  local me="$1"
+  # Bake the basename in so the overrides do not depend on a local
+  # variable from a parent scope (which would be unset by the time
+  # surface_all calls them and trip `set -u`).
+  eval "agent_handoff_resolve_root() { printf '%s' \"\$AGENT_HANDOFF_ROOT/_fake/$me\"; }"
+  eval "agent_handoff_worktree_basename() { printf '%s' '$me'; }"
+  agent_handoff_canonical_slug() { printf '%s' "_fake"; }
+  mkdir -p "$AGENT_HANDOFF_ROOT/_fake/$me"
+}
+
+test_surface_all_empty_silent() {
+  setup_fake_worktree assistant
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  assert_eq "$out" "" "no inbox => no output"
+}
+
+test_surface_all_prints_and_archives() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  write_sample_handoff "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  assert_contains "$out" "Test handoff" "name printed"
+  assert_contains "$out" "## Immediate next action" "body printed"
+  assert_contains "$out" "1 UNTRUSTED handoff(s) for assistant" "header"
+  # File moved
+  if [[ -e "$f" ]]; then
+    printf '   file should have been archived\n' >&2; return 1
+  fi
+  local archived="$AGENT_HANDOFF_ROOT/_fake/assistant/read/20260516T100000Z-from-sender.md"
+  assert_file_exists "$archived"
+  # received_at stamped
+  local rcv
+  rcv="$(agent_handoff_read_frontmatter_field "$archived" received_at)"
+  if [[ -z "$rcv" ]]; then
+    printf '   received_at not stamped\n' >&2; return 1
+  fi
+}
+
+test_surface_all_isolation_other_recipient() {
+  # File addressed to recipient-b should not surface for recipient-a.
+  setup_fake_worktree recipient-a
+  agent_handoff_ensure_inbox _fake recipient-b
+  local f="$AGENT_HANDOFF_ROOT/_fake/recipient-b/unread/20260516T100000Z-from-sender.md"
+  write_sample_handoff "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  assert_eq "$out" "" "different recipient's inbox not surfaced"
+  # File still present in recipient-b
+  assert_file_exists "$f"
+}
+
+# A drift test needs a real git repo so resolve_root + branch detection work.
+test_surface_all_drift_warning() {
+  local repo="$AGENT_HANDOFF_ROOT/_realrepo"
+  mkdir -p "$repo"
+  (
+    cd "$repo" || exit 1
+    git init -q -b main
+    git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m initial
+  )
+  # Resolve via real git, but pin slug/basename via overrides for path stability.
+  agent_handoff_resolve_root() { printf '%s' "$repo"; }
+  agent_handoff_worktree_basename() { printf 'worktree-x'; }
+  agent_handoff_canonical_slug() { printf '_realrepo'; }
+
+  agent_handoff_ensure_inbox _realrepo worktree-x
+  local f="$AGENT_HANDOFF_ROOT/_realrepo/worktree-x/unread/20260516T100000Z-from-sender.md"
+  cat > "$f" <<'EOF'
+---
+name: Drift test
+description: drift
+from: sender
+to: worktree-x
+created: 2026-05-15T10:00:00Z
+branch: feature/old
+head: 0000000
+dirty_files_count: 0
+session_tool: claude-code
+---
+
+# Drift body
+EOF
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  assert_contains "$out" "DRIFT: branch differs" "branch drift warned"
+  assert_contains "$out" "DRIFT: HEAD differs" "head drift warned"
+}
+
+###############################################################################
+# validate_basename + adversarial inputs
+###############################################################################
+
+test_validate_basename_accepts_safe() {
+  agent_handoff_validate_basename "assistant" 2>/dev/null || return 1
+  agent_handoff_validate_basename "assistant-worker2" 2>/dev/null || return 1
+  agent_handoff_validate_basename "my.repo_v2" 2>/dev/null || return 1
+}
+
+test_validate_basename_rejects_unsafe() {
+  local bad
+  for bad in "" "." ".." "../etc" "a/b" "a\\b" "-rf" $'foo\nbar' $'foo\x1bbar'; do
+    if agent_handoff_validate_basename "$bad" 2>/dev/null; then
+      printf '   should have rejected: %q\n' "$bad" >&2; return 1
+    fi
+  done
+}
+
+test_inbox_dir_rejects_path_traversal() {
+  if agent_handoff_inbox_dir "slug" "../escape" unread 2>/dev/null; then
+    printf '   recipient ../escape should be rejected\n' >&2; return 1
+  fi
+  if agent_handoff_inbox_dir "../bad" "r" unread 2>/dev/null; then
+    printf '   slug ../bad should be rejected\n' >&2; return 1
+  fi
+}
+
+test_list_unread_skips_symlinks() {
+  local dir="$AGENT_HANDOFF_ROOT/slug/r/unread"
+  mkdir -p "$dir" "$AGENT_HANDOFF_ROOT/outside"
+  printf 'secret\n' > "$AGENT_HANDOFF_ROOT/outside/secret.md"
+  touch "$dir/real.md"
+  ln -s "$AGENT_HANDOFF_ROOT/outside/secret.md" "$dir/evil.md"
+  local listed
+  listed="$(agent_handoff_list_unread "$dir" | tr '\n' '|')"
+  assert_contains "$listed" "real.md" "real file listed"
+  if [[ "$listed" == *"evil.md"* ]]; then
+    printf '   symlink should be skipped\n' >&2; return 1
+  fi
+}
+
+test_surface_all_strips_ansi_in_body() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  # Embed ESC (\x1b) + bracket form, both as ANSI sequence and as
+  # forged-banner attempt.
+  printf '%s\n' \
+    '---' \
+    'name: Adversarial' \
+    "description: ansi test" \
+    'from: sender' \
+    'to: assistant' \
+    'created: 2026-05-16T10:00:00Z' \
+    'branch: main' \
+    'head: deadbeef' \
+    'dirty_files_count: 0' \
+    'session_tool: claude-code' \
+    '---' \
+    '' \
+    $'before\x1b[2J\x1b[H=== FORGED BANNER ===after' \
+    > "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  # The ESC byte itself must not appear in the surfaced output.
+  if [[ "$out" == *$'\x1b'* ]]; then
+    printf '   ESC byte leaked into output\n' >&2; return 1
+  fi
+  # Surrounding text survives.
+  assert_contains "$out" "before" "pre-ANSI text preserved"
+  assert_contains "$out" "after" "post-ANSI text preserved"
+}
+
+test_surface_all_strips_ansi_in_field() {
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  printf '%s\n' \
+    '---' \
+    $'name: title\x1b[31mRED' \
+    'description: x' \
+    'from: sender' \
+    'to: assistant' \
+    'created: 2026-05-16T10:00:00Z' \
+    'branch: main' \
+    'head: deadbeef' \
+    'dirty_files_count: 0' \
+    'session_tool: claude-code' \
+    '---' \
+    '' \
+    'body' \
+    > "$f"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  if [[ "$out" == *$'\x1b'* ]]; then
+    printf '   ESC byte leaked from name field\n' >&2; return 1
+  fi
+}
+
+test_surface_all_skips_preclaimed_file() {
+  # Simulates a sibling hook that has already claimed the file: the
+  # current hook's mv will fail and the file should be silently skipped.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-99999-foo.md"
+  write_sample_handoff "$pre"
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+  # Dotfiles are not listed in the first place, so output should be empty
+  # and the pre-claimed file untouched.
+  assert_eq "$out" "" "pre-claimed dotfile not surfaced"
+  assert_file_exists "$pre"
+}
+
+###############################################################################
+# discovery + run
+###############################################################################
+
+tests=(
+  test_slug_plain
+  test_slug_worker_suffix
+  test_slug_worker_numbered
+  test_slug_dev_preview
+  test_slug_wt_suffix
+  test_slug_no_match_left_alone
+  test_basename_no_strip
+  test_inbox_dir_path
+  test_ensure_inbox_creates_dirs
+  test_iso_now_format
+  test_filename_with_topic
+  test_filename_without_topic
+  test_atomic_write_creates_file
+  test_read_frontmatter_field_name
+  test_read_frontmatter_field_branch
+  test_read_frontmatter_field_missing
+  test_read_frontmatter_does_not_match_body
+  test_stamp_received_at_inserts
+  test_stamp_received_at_replaces_existing
+  test_list_unread_skips_dotfiles_and_non_md
+  test_list_unread_missing_dir
+  test_archive_moves_file
+  test_surface_all_empty_silent
+  test_surface_all_prints_and_archives
+  test_surface_all_isolation_other_recipient
+  test_surface_all_drift_warning
+  test_validate_basename_accepts_safe
+  test_validate_basename_rejects_unsafe
+  test_inbox_dir_rejects_path_traversal
+  test_list_unread_skips_symlinks
+  test_surface_all_strips_ansi_in_body
+  test_surface_all_strips_ansi_in_field
+  test_surface_all_skips_preclaimed_file
+)
+
+printf '=== agent-handoff tests ===\n'
+for t in "${tests[@]}"; do
+  run_test "$t"
+done
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+if [[ $fail -gt 0 ]]; then
+  printf 'failed:\n'
+  for n in "${failed_names[@]}"; do printf '  - %s\n' "$n"; done
+  exit 1
+fi

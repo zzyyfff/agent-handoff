@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# bin/install-into-project [project-dir]
+#
+# Wires the agent-handoff SessionStart hooks into a target project for
+# both Claude Code (.claude/settings.json) and Codex CLI
+# (.codex/hooks.json — falls back to ~/.codex/hooks.json if no project
+# .codex/ exists). Idempotent.
+#
+# Requires `jq`.
+
+set -euo pipefail
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'error: jq is required\n' >&2
+  exit 1
+fi
+
+repo_root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+target="${1:-$PWD}"
+target="$(cd "$target" && pwd -P)"
+
+cc_hook="$repo_root/adapters/claude-code/hooks/surface-handoffs.sh"
+cx_hook="$repo_root/adapters/codex-cli/hooks/surface-handoffs.sh"
+
+if [[ ! -x "$cc_hook" ]]; then
+  printf 'error: claude-code hook missing or not executable: %s\n' "$cc_hook" >&2
+  exit 1
+fi
+if [[ ! -x "$cx_hook" ]]; then
+  printf 'error: codex-cli hook missing or not executable: %s\n' "$cx_hook" >&2
+  exit 1
+fi
+
+###############################################################################
+# Claude Code: .claude/settings.json
+###############################################################################
+
+cc_settings_dir="$target/.claude"
+cc_settings="$cc_settings_dir/settings.json"
+
+mkdir -p "$cc_settings_dir"
+if [[ ! -f "$cc_settings" ]]; then
+  echo '{}' > "$cc_settings"
+fi
+
+cc_tmp="$(mktemp)"
+trap 'rm -f "$cc_tmp"' EXIT
+
+# Build the entry; ensure exactly one entry whose command equals $cc_hook.
+jq --arg cmd "$cc_hook" '
+  . as $orig
+  | (.hooks // {}) as $hooks
+  | ($hooks.SessionStart // []) as $arr
+  | ($arr | map(select((.command // "") != $cmd))) as $cleaned
+  | $orig
+  | .hooks = ($hooks | .SessionStart = ($cleaned + [{"type":"command","command":$cmd}]))
+' "$cc_settings" > "$cc_tmp"
+mv "$cc_tmp" "$cc_settings"
+trap - EXIT
+
+printf 'wired claude-code hook into %s\n' "$cc_settings"
+
+###############################################################################
+# Codex CLI: prefer project-local .codex/hooks.json, fall back to global.
+###############################################################################
+
+if [[ -d "$target/.codex" ]]; then
+  cx_settings="$target/.codex/hooks.json"
+else
+  mkdir -p "$HOME/.codex"
+  cx_settings="$HOME/.codex/hooks.json"
+fi
+
+if [[ ! -f "$cx_settings" ]]; then
+  echo '{}' > "$cx_settings"
+fi
+
+cx_tmp="$(mktemp)"
+trap 'rm -f "$cx_tmp"' EXIT
+
+# Codex hook format (May 2026): { "SessionStart": [ { "script": "..." } ] }
+# Wired similarly to Claude Code: remove any prior entry pointing at the
+# same script, then append ours.
+jq --arg script "$cx_hook" '
+  . as $orig
+  | (.SessionStart // []) as $arr
+  | ($arr | map(select((.script // "") != $script))) as $cleaned
+  | $orig
+  | .SessionStart = ($cleaned + [{"script":$script}])
+' "$cx_settings" > "$cx_tmp"
+mv "$cx_tmp" "$cx_settings"
+trap - EXIT
+
+printf 'wired codex-cli hook into %s\n' "$cx_settings"

@@ -135,7 +135,7 @@ agent-handoff/
 ├── examples/
 │   └── sample-handoff.md
 └── tests/
-    └── run-tests.sh            # 26 tests, no external deps
+    └── run-tests.sh            # 46 tests, no external deps
 ```
 
 ## Tests

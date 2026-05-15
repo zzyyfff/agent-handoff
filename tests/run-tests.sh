@@ -586,6 +586,29 @@ test_atomic_write_does_not_overwrite_via_helper() {
   assert_eq "$(cat "$got")" "newcomer" "newcomer landed at suffixed path"
 }
 
+test_atomic_write_directory_at_dest_treated_as_collision() {
+  # A directory at the candidate path must NOT make `ln src dir/`
+  # succeed by linking inside it (which would make the file invisible
+  # to glob-based readers). safe_rename must skip it and use a suffix.
+  agent_handoff_ensure_inbox slug-aw recip
+  local dest="$AGENT_HANDOFF_ROOT/slug-aw/recip/unread/dirclash.md"
+  mkdir -p "$dest"  # dest is now a directory
+  local got
+  got="$(printf 'content\n' | agent_handoff_atomic_write "$dest")"
+  # The directory must still be a directory, not turned into a file.
+  if [[ ! -d "$dest" ]]; then
+    printf '   expected %s to remain a directory\n' "$dest" >&2; exit 1
+  fi
+  # The actual landing must be a suffixed file.
+  if [[ "$got" == "$dest" ]]; then
+    printf '   should not have landed at directory path\n' >&2; exit 1
+  fi
+  if [[ ! "$got" =~ /dirclash-[0-9a-f]{5}\.md$ ]]; then
+    printf '   expected suffixed path, got %s\n' "$got" >&2; exit 1
+  fi
+  assert_eq "$(cat "$got")" "content" "content landed at suffixed path"
+}
+
 test_archive_collision_appends_hex_suffix() {
   agent_handoff_ensure_inbox slug-arch me
   local read_dir="$AGENT_HANDOFF_ROOT/slug-arch/me/read"
@@ -831,6 +854,7 @@ tests=(
   test_atomic_write_returns_landing_path
   test_atomic_write_collision_appends_hex_suffix
   test_atomic_write_does_not_overwrite_via_helper
+  test_atomic_write_directory_at_dest_treated_as_collision
   test_archive_collision_appends_hex_suffix
   test_print_body_warns_and_dumps_when_frontmatter_unclosed
   test_print_body_warns_on_empty_file

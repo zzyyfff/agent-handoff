@@ -96,10 +96,27 @@ agent_handoff_safe_rename() {
       hex="$(printf '%04x%01x' "$RANDOM" "$((RANDOM % 16))")"
       candidate="$dir/${stem}-${hex}${ext}"
     fi
+    # A directory at the candidate path would let `ln src candidate/`
+    # succeed by hard-linking *inside* the directory — which then makes
+    # the file invisible to `*.md` glob readers. Treat as a collision.
+    [[ -d "$candidate" ]] && continue
     if ln -- "$src" "$candidate" 2>/dev/null; then
       rm -f -- "$src"
       printf '%s' "$candidate"
       return 0
+    fi
+    # `ln` failed. If candidate already exists, this is a real
+    # collision — try the next suffix. If candidate does NOT exist, the
+    # filesystem may not support hardlinks (FAT/exFAT, some network
+    # mounts); fall back to a non-atomic `mv` so handoff still works on
+    # those filesystems. We lose strict atomicity in that fallback path
+    # but the TOCTOU window is tiny and beats failing on every install
+    # that happens to use a non-hardlink FS.
+    if [[ ! -e "$candidate" ]]; then
+      if mv -- "$src" "$candidate" 2>/dev/null; then
+        printf '%s' "$candidate"
+        return 0
+      fi
     fi
   done
   printf 'agent-handoff: safe_rename failed after 6 collision retries at %s\n' \

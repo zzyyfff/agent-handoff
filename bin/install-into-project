@@ -78,15 +78,28 @@ fi
 cx_tmp="$(mktemp)"
 trap 'rm -f "$cx_tmp"' EXIT
 
-# Codex hook format (May 2026): { "SessionStart": [ { "script": "..." } ] }
-# Wired similarly to Claude Code: remove any prior entry pointing at the
-# same script, then append ours.
-jq --arg script "$cx_hook" '
+# Codex CLI hook format (v0.130+, verified against
+# https://developers.openai.com/codex/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# The outer SessionStart array is matcher-groups; each group has its
+# own inner `hooks` array of handlers. We remove any matcher-group whose
+# inner hooks include our command (idempotency across reinstalls), then
+# append a fresh group containing just ours.
+jq --arg cmd "$cx_hook" '
   . as $orig
-  | (.SessionStart // []) as $arr
-  | ($arr | map(select((.script // "") != $script))) as $cleaned
+  | (.hooks // {}) as $hooks
+  | ($hooks.SessionStart // []) as $arr
+  | ($arr | map(select(
+      ([.hooks // [] | .[] | .command // ""] | index($cmd)) == null
+    ))) as $cleaned
   | $orig
-  | .SessionStart = ($cleaned + [{"script":$script}])
+  | .hooks = ($hooks | .SessionStart = (
+      $cleaned + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
 ' "$cx_settings" > "$cx_tmp"
 mv "$cx_tmp" "$cx_settings"
 trap - EXIT

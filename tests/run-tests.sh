@@ -541,6 +541,90 @@ test_surface_all_skips_preclaimed_file() {
 }
 
 ###############################################################################
+# install-into-project (Codex JSON shape regression)
+###############################################################################
+
+# These tests exercise bin/install-into-project against a fresh fake
+# project dir. They require jq (same as the script itself).
+
+test_install_into_project_writes_correct_codex_format() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local codex_settings="$HOME/.codex/hooks.json"
+  assert_file_exists "$codex_settings"
+  # Must be at hooks.SessionStart[*].hooks[*].command (NOT at top-level
+  # .SessionStart[*].script — the pre-fix shape Codex silently ignored).
+  local count
+  count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
+              | length' "$codex_settings")"
+  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart"
+  # The bad top-level SessionStart key should not exist.
+  local bad
+  bad="$(jq 'has("SessionStart")' "$codex_settings")"
+  assert_eq "$bad" "false" "no top-level SessionStart (Codex ignores it)"
+  # The script field shape should not be present anywhere.
+  local script_field
+  script_field="$(jq '[..|.script? // empty] | length' "$codex_settings")"
+  assert_eq "$script_field" "0" "no .script field anywhere (wrong shape)"
+}
+
+test_install_into_project_is_idempotent() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local cc_count cx_count
+  cc_count="$(jq '[.hooks.SessionStart[]
+                   | select((.command//"") | endswith("surface-handoffs.sh"))]
+                 | length' "$project/.claude/settings.json")"
+  assert_eq "$cc_count" "1" "claude-code: exactly one SessionStart entry after 3 installs"
+  cx_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select((.command//"") | endswith("surface-handoffs.sh"))]
+                 | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_count" "1" "codex-cli: exactly one SessionStart entry after 3 installs"
+}
+
+test_install_into_project_preserves_other_hooks() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  mkdir -p "$HOME/.codex"
+  # Seed an existing unrelated hook the install must preserve.
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/existing-hook"}]}
+    ],
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/usr/local/bin/existing-session-hook"}]}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local preserved
+  preserved="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.codex/hooks.json")"
+  assert_eq "$preserved" "/usr/local/bin/existing-hook" "PreToolUse preserved"
+  local kept_session
+  kept_session="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                       | select(.command == "/usr/local/bin/existing-session-hook")]
+                     | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$kept_session" "1" "existing SessionStart entry kept alongside agent-handoff"
+}
+
+###############################################################################
 # discovery + run
 ###############################################################################
 
@@ -578,6 +662,9 @@ tests=(
   test_surface_all_strips_ansi_in_body
   test_surface_all_strips_ansi_in_field
   test_surface_all_skips_preclaimed_file
+  test_install_into_project_writes_correct_codex_format
+  test_install_into_project_is_idempotent
+  test_install_into_project_preserves_other_hooks
 )
 
 printf '=== agent-handoff tests ===\n'

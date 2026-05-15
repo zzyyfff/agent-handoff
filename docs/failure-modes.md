@@ -154,6 +154,25 @@ rejects `.`, `..`, leading dashes, and any other byte. The writer skill
 validates the user-supplied `--to`; the library re-validates inside
 `agent_handoff_inbox_dir` so a buggy adapter cannot bypass the check.
 
+## Filesystem without hardlink support (FAT/exFAT, some network mounts)
+
+**Symptom.** `agent_handoff_safe_rename` (used by `atomic_write`,
+`archive`, and the inline archive in `surface_all`) prefers `ln`
+because it atomically fails when the target exists. On filesystems
+that don't support hard links — FAT32, exFAT, some SMB/NFS mounts —
+every `ln` would fail.
+
+**Behaviour.** When `ln` fails AND the candidate path doesn't already
+exist, safe_rename falls back to a non-atomic `mv`. The file still
+lands at the candidate path; we lose strict atomicity but the TOCTOU
+window between the existence check and the `mv` is tiny.
+
+**Why not require hardlink-capable FS.** Refusing to write would break
+agent-handoff entirely for users whose `~/.agent-handoffs/` happens to
+live on FAT (rare on dev machines, common on some USB sticks and
+shared mounts). The fallback path keeps the project usable everywhere
+while preserving collision detection on the common case.
+
 ## Hostile inbox entries (symlinks, FIFOs)
 
 **Symptom.** Someone with write access to your `~/.agent-handoffs/`

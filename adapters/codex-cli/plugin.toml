@@ -1,0 +1,20 @@
+# Codex CLI plugin manifest for agent-handoff.
+#
+# Codex discovers plugins under ~/.codex/plugins/<name>/. Symlink the
+# adapters/codex-cli directory there via bin/install-codex-plugin.
+#
+# Documented at https://developers.openai.com/codex/plugins as of May 2026.
+
+name = "agent-handoff"
+version = "0.1.0"
+description = "Worktree-scoped session handoffs, shared with Claude Code."
+
+[commands.handoff]
+description = "Write a worktree-scoped handoff to be surfaced in the next session."
+# The handoff command runs the same procedure as the Claude Code skill;
+# Codex invokes the plugin command, which delegates to its script.
+script = "commands/handoff.sh"
+
+[hooks.session_start]
+script = "hooks/surface-handoffs.sh"
+description = "Surface unread handoffs for this worktree."

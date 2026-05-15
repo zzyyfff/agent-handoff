@@ -90,15 +90,21 @@ trap 'rm -f "$cx_tmp"' EXIT
 # inner hooks include our command (idempotency across reinstalls), then
 # append a fresh group containing just ours.
 jq --arg cmd "$cx_hook" '
-  . as $orig
+  # 1. Strip any stale top-level `SessionStart` left over from the
+  #    pre-fix install (wrong shape that Codex silently ignored).
+  del(.SessionStart)
+  # 2. Surgically strip our command from existing matcher groups.
+  #    Preserves sibling hooks the user may have placed alongside ours;
+  #    drops a matcher group only if it becomes empty after removal.
   | (.hooks // {}) as $hooks
   | ($hooks.SessionStart // []) as $arr
-  | ($arr | map(select(
-      ([.hooks // [] | .[] | .command // ""] | index($cmd)) == null
-    ))) as $cleaned
-  | $orig
+  | ($arr | map(
+      .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+      | select((.hooks | length) > 0)
+    )) as $pruned
+  # 3. Append the canonical agent-handoff group.
   | .hooks = ($hooks | .SessionStart = (
-      $cleaned + [{"hooks": [{"type":"command","command":$cmd}]}]
+      $pruned + [{"hooks": [{"type":"command","command":$cmd}]}]
     ))
 ' "$cx_settings" > "$cx_tmp"
 mv "$cx_tmp" "$cx_settings"

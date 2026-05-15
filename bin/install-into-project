@@ -46,14 +46,31 @@ fi
 cc_tmp="$(mktemp)"
 trap 'rm -f "$cc_tmp"' EXIT
 
-# Build the entry; ensure exactly one entry whose command equals $cc_hook.
+# Claude Code hook format (per https://code.claude.com/docs/en/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# Each SessionStart entry is a matcher group with its own inner `hooks`
+# array of handlers — same shape as PreToolUse and the Codex hook
+# format. The pre-fix code wrote a flat `{type, command}` directly into
+# SessionStart, which Claude Code rejects at startup with
+# "hooks: Expected array, but received undefined". Idempotency: drop
+# our command from any existing matcher group's inner hooks, drop the
+# group if empty, then append our canonical group.
 jq --arg cmd "$cc_hook" '
   . as $orig
   | (.hooks // {}) as $hooks
   | ($hooks.SessionStart // []) as $arr
-  | ($arr | map(select((.command // "") != $cmd))) as $cleaned
+  | ($arr | map(
+      .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+      | select((.hooks | length) > 0)
+    )) as $pruned
   | $orig
-  | .hooks = ($hooks | .SessionStart = ($cleaned + [{"type":"command","command":$cmd}]))
+  | .hooks = ($hooks | .SessionStart = (
+      $pruned + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
 ' "$cc_settings" > "$cc_tmp"
 mv "$cc_tmp" "$cc_settings"
 trap - EXIT

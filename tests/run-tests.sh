@@ -716,7 +716,7 @@ test_install_into_project_is_idempotent() {
   "$repo_root/bin/install-into-project" "$project" >/dev/null
   "$repo_root/bin/install-into-project" "$project" >/dev/null
   local cc_count cx_count
-  cc_count="$(jq '[.hooks.SessionStart[]
+  cc_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
                    | select((.command//"") | endswith("surface-handoffs.sh"))]
                  | length' "$project/.claude/settings.json")"
   assert_eq "$cc_count" "1" "claude-code: exactly one SessionStart entry after 3 installs"
@@ -724,6 +724,72 @@ test_install_into_project_is_idempotent() {
                    | select((.command//"") | endswith("surface-handoffs.sh"))]
                  | length' "$HOME/.codex/hooks.json")"
   assert_eq "$cx_count" "1" "codex-cli: exactly one SessionStart entry after 3 installs"
+}
+
+test_install_into_project_writes_correct_claude_code_format() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project"
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  local cc_settings="$project/.claude/settings.json"
+  assert_file_exists "$cc_settings"
+  # Per https://code.claude.com/docs/en/hooks each event entry is a
+  # matcher group with an inner `hooks` array. A flat
+  # {type,command} at the SessionStart level is rejected by
+  # Claude Code at startup with "hooks: Expected array, but received
+  # undefined".
+  local count
+  count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
+              | length' "$cc_settings")"
+  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart[*].hooks"
+  # No flat {type,command} entries directly at the SessionStart level —
+  # those are the pre-fix shape Claude Code rejects.
+  local flat
+  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' "$cc_settings")"
+  assert_eq "$flat" "0" "no flat {type,command} at SessionStart level (wrong shape)"
+  # Every entry under SessionStart must have an inner `hooks` array.
+  local valid
+  valid="$(jq '[.hooks.SessionStart[]? | select((.hooks|type)=="array")] | length' "$cc_settings")"
+  local total
+  total="$(jq '.hooks.SessionStart | length' "$cc_settings")"
+  assert_eq "$valid" "$total" "every SessionStart entry has inner hooks array"
+}
+
+test_install_into_project_migrates_flat_claude_code_session_start() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  local project="$AGENT_HANDOFF_ROOT/_proj"
+  mkdir -p "$project/.claude"
+  # Pre-fix install wrote flat {type,command} directly under
+  # SessionStart. Reinstall must drop the broken entry and produce a
+  # well-formed wrapper.
+  local stale_cmd
+  stale_cmd="$(cd "$repo_root" && pwd -P)/adapters/claude-code/hooks/surface-handoffs.sh"
+  cat > "$project/.claude/settings.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"type": "command", "command": "$stale_cmd"}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  # No flat {type,command} should remain under SessionStart.
+  local flat
+  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' \
+              "$project/.claude/settings.json")"
+  assert_eq "$flat" "0" "flat pre-fix entry removed on reinstall"
+  # Exactly one well-formed entry should reference our hook.
+  local count
+  count="$(jq --arg c "$stale_cmd" '[.hooks.SessionStart[]?.hooks[]?
+                                     | select(.command == $c)] | length' \
+              "$project/.claude/settings.json")"
+  assert_eq "$count" "1" "well-formed entry replaces the flat one"
 }
 
 test_install_into_project_migrates_stale_top_level_session_start() {
@@ -860,6 +926,8 @@ tests=(
   test_print_body_warns_on_empty_file
   test_surface_all_surfaces_malformed_with_warning
   test_install_into_project_writes_correct_codex_format
+  test_install_into_project_writes_correct_claude_code_format
+  test_install_into_project_migrates_flat_claude_code_session_start
   test_install_into_project_is_idempotent
   test_install_into_project_migrates_stale_top_level_session_start
   test_install_into_project_preserves_sibling_hook_in_same_group

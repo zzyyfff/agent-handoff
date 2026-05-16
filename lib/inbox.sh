@@ -348,7 +348,15 @@ agent_handoff_recover_stale_claims() {
     # Dead PID (or low/fabricated PID). Race-safe handoff: re-claim
     # under OUR PID via atomic mv. If a sibling sweeper got here
     # first, our mv fails and we skip — it will handle the recovery.
+    # Edge case: a prior crashed invocation of OUR own PID could have
+    # left `.claim-$$-$orig` already in place (extremely rare —
+    # requires PID reuse + same orig). Refuse to overwrite by checking
+    # existence first; if our slot is taken, leave the file alone for
+    # the next sweep.
     my_claim="$dir/.claim-$$-$orig"
+    if [[ -e "$my_claim" ]]; then
+      continue
+    fi
     if ! mv -- "$f" "$my_claim" 2>/dev/null; then
       continue
     fi
@@ -455,31 +463,49 @@ agent_handoff_surface_all() {
   # mid-function via `set -e` or a signal), so the local pending_*
   # arrays are still accessible.
   #
-  # Caller's existing EXIT trap is saved and restored — we MUST NOT
-  # silently drop a caller's cleanup (lock release, tmp-dir rm, etc).
+  # Caller's existing EXIT trap is preserved by CHAINING: we snapshot
+  # it via `trap -p EXIT`, then our unwind trap runs the self-heal
+  # AND re-runs the caller's prior trap body. This is the only way to
+  # compose EXIT traps in bash (single slot per signal). On clean
+  # return we restore the caller's trap directly so it is the only
+  # one that fires for the caller's own exit. On unwind, both run.
   local _prev_exit_trap
   _prev_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
+  # Extract just the body from `trap -- 'BODY' EXIT` for use in our
+  # chained trap. bash quoting: -p output uses single-quote escaping
+  # (`'\''`), so eval'ing the captured string runs the original body.
+  local _prev_exit_body=""
+  if [[ -n "$_prev_exit_trap" ]]; then
+    # `trap -p EXIT` prints: trap -- 'BODY' EXIT
+    # Strip the literal prefix and trailing ` EXIT`, leaving 'BODY'.
+    _prev_exit_body="${_prev_exit_trap#trap -- }"
+    _prev_exit_body="${_prev_exit_body% EXIT}"
+  fi
   agent_handoff_surface_all_unwind() {
     local _i _cf _orig _udir
     # Guard against the trap firing AFTER the function has returned
     # (in which case `pending_claims` is unbound under `set -u`).
     # Under our actual usage the function is still on the stack when
     # the trap fires, but the defensive check costs nothing.
-    if ! declare -p pending_claims >/dev/null 2>&1; then
-      return 0
+    if declare -p pending_claims >/dev/null 2>&1; then
+      for (( _i = 0; _i < ${#pending_claims[@]}; _i++ )); do
+        _cf="${pending_claims[$_i]}"
+        _orig="${pending_originals[$_i]}"
+        _udir="${pending_unread[$_i]}"
+        [[ -z "$_cf" ]] && continue
+        [[ ! -e "$_cf" ]] && continue
+        # Use safe_rename so we never silently overwrite a fresh handoff
+        # that arrived under <orig> after we claimed: ours lands as
+        # `<orig>-<hex>.md` instead of clobbering the new one. Suppress
+        # all output — we're in shell-teardown context.
+        agent_handoff_safe_rename "$_cf" "$_udir/$_orig" >/dev/null 2>&1 || true
+      done
     fi
-    for (( _i = 0; _i < ${#pending_claims[@]}; _i++ )); do
-      _cf="${pending_claims[$_i]}"
-      _orig="${pending_originals[$_i]}"
-      _udir="${pending_unread[$_i]}"
-      [[ -z "$_cf" ]] && continue
-      [[ ! -e "$_cf" ]] && continue
-      # Use safe_rename so we never silently overwrite a fresh handoff
-      # that arrived under <orig> after we claimed: ours lands as
-      # `<orig>-<hex>.md` instead of clobbering the new one. Suppress
-      # all output — we're in shell-teardown context.
-      agent_handoff_safe_rename "$_cf" "$_udir/$_orig" >/dev/null 2>&1 || true
-    done
+    # Chain the caller's prior trap body, if any. Best-effort: any
+    # error in the caller's cleanup must not abort our teardown.
+    if [[ -n "${_prev_exit_body:-}" ]]; then
+      eval "$_prev_exit_body" 2>/dev/null || true
+    fi
   }
   trap 'agent_handoff_surface_all_unwind' EXIT
 

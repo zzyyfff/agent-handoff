@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# bin/install
+#
+# Installs agent-handoff at the USER level so its SessionStart hooks
+# fire for every project automatically — no per-project opt-in needed.
+#
+# Does all of:
+#   1. Symlink adapters/claude-code/skill/ -> ~/.claude/skills/handoff/
+#   2. Symlink adapters/codex-cli/         -> ~/.codex/plugins/agent-handoff/
+#   3. Wire SessionStart hook into ~/.claude/settings.json
+#   4. Wire SessionStart hook into ~/.codex/hooks.json
+#
+# Idempotent — safe to re-run. Surgically removes prior agent-handoff
+# entries before re-adding, and migrates pre-fix entry shapes.
+#
+# Requires `jq`.
+
+set -euo pipefail
+
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'error: jq is required\n' >&2
+  exit 1
+fi
+
+repo_root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+cc_hook="$repo_root/adapters/claude-code/hooks/surface-handoffs.sh"
+cx_hook="$repo_root/adapters/codex-cli/hooks/surface-handoffs.sh"
+cc_skill_src="$repo_root/adapters/claude-code/skill"
+cx_plugin_src="$repo_root/adapters/codex-cli"
+
+if [[ ! -x "$cc_hook" ]]; then
+  printf 'error: claude-code hook missing or not executable: %s\n' "$cc_hook" >&2
+  exit 1
+fi
+if [[ ! -x "$cx_hook" ]]; then
+  printf 'error: codex-cli hook missing or not executable: %s\n' "$cx_hook" >&2
+  exit 1
+fi
+if [[ ! -d "$cc_skill_src" ]]; then
+  printf 'error: claude-code skill source missing: %s\n' "$cc_skill_src" >&2
+  exit 1
+fi
+if [[ ! -d "$cx_plugin_src" ]]; then
+  printf 'error: codex-cli plugin source missing: %s\n' "$cx_plugin_src" >&2
+  exit 1
+fi
+
+###############################################################################
+# Symlink helper: idempotent, refuses to clobber non-symlinks
+###############################################################################
+
+install_symlink() {
+  local src="$1" dest="$2" parent
+  parent="$(dirname -- "$dest")"
+  mkdir -p "$parent"
+
+  if [[ -L "$dest" ]]; then
+    local current
+    current="$(readlink "$dest")"
+    if [[ "$current" == "$src" ]]; then
+      printf 'symlink already installed: %s -> %s\n' "$dest" "$src"
+      return 0
+    fi
+    printf 'replacing stale symlink: %s (was -> %s)\n' "$dest" "$current"
+    rm -- "$dest"
+  elif [[ -e "$dest" ]]; then
+    printf 'error: %s exists and is not a symlink; refusing to clobber\n' "$dest" >&2
+    exit 1
+  fi
+
+  ln -s "$src" "$dest"
+  printf 'installed symlink: %s -> %s\n' "$dest" "$src"
+}
+
+###############################################################################
+# 1. Claude Code skill symlink
+###############################################################################
+
+install_symlink "$cc_skill_src" "$HOME/.claude/skills/handoff"
+
+###############################################################################
+# 2. Codex CLI plugin symlink
+###############################################################################
+
+install_symlink "$cx_plugin_src" "$HOME/.codex/plugins/agent-handoff"
+
+###############################################################################
+# 3. Claude Code: ~/.claude/settings.json
+###############################################################################
+
+cc_settings_dir="$HOME/.claude"
+cc_settings="$cc_settings_dir/settings.json"
+
+mkdir -p "$cc_settings_dir"
+if [[ ! -f "$cc_settings" ]]; then
+  echo '{}' > "$cc_settings"
+fi
+
+cc_tmp="$(mktemp)"
+trap 'rm -f "$cc_tmp"' EXIT
+
+# Claude Code hook format (per https://code.claude.com/docs/en/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# Each SessionStart entry is a matcher group with its own inner `hooks`
+# array of handlers. A flat `{type, command}` directly in SessionStart is
+# the pre-fix shape Claude Code rejects with "hooks: Expected array, but
+# received undefined".
+#
+# Migration / idempotency:
+# - Match by stable signature, not exact path. The current install may
+#   live at a different absolute path than a prior install (repo moved,
+#   second clone, worktree refactor); pruning by suffix removes the
+#   stale entry instead of leaving a dead absolute path that errors on
+#   every session in every project. We anchor on
+#   `/adapters/claude-code/hooks/surface-handoffs.sh` — uniquely ours,
+#   no collisions with other tools.
+# - Well-formed matcher groups: surgically remove any of our commands
+#   from the inner hooks array; drop the group only if it becomes empty.
+# - Pre-fix flat entries: if ours, drop; if someone else's, wrap into a
+#   valid matcher group so the user's other broken-pre-fix hooks recover
+#   automatically rather than getting silently lost.
+# - Then append our canonical group with the current absolute path.
+jq --arg cmd "$cc_hook" --arg sig "/adapters/claude-code/hooks/surface-handoffs.sh" '
+  . as $orig
+  | (.hooks // {}) as $hooks
+  | ($hooks.SessionStart // []) as $arr
+  | ($arr | map(
+      if (.hooks // null) != null then
+        .hooks = ([.hooks // [] | .[] | select(((.command // "") | endswith($sig)) | not)])
+        | select((.hooks | length) > 0)
+      elif (.type and .command) then
+        if (.command | endswith($sig)) then empty
+        else {"hooks": [.]}
+        end
+      else
+        .
+      end
+    )) as $migrated
+  | $orig
+  | .hooks = ($hooks | .SessionStart = (
+      $migrated + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
+' "$cc_settings" > "$cc_tmp"
+mv "$cc_tmp" "$cc_settings"
+trap - EXIT
+
+printf 'wired claude-code hook into %s\n' "$cc_settings"
+
+###############################################################################
+# 4. Codex CLI: ~/.codex/hooks.json (user-global; loads unconditionally)
+###############################################################################
+
+cx_settings_dir="$HOME/.codex"
+cx_settings="$cx_settings_dir/hooks.json"
+
+mkdir -p "$cx_settings_dir"
+if [[ ! -f "$cx_settings" ]]; then
+  echo '{}' > "$cx_settings"
+fi
+
+cx_tmp="$(mktemp)"
+trap 'rm -f "$cx_tmp"' EXIT
+
+# Codex CLI hook format (v0.130+, verified against
+# https://developers.openai.com/codex/hooks):
+#
+#   { "hooks": { "SessionStart": [
+#       { "hooks": [ { "type": "command", "command": "<script>" } ] }
+#   ]}}
+#
+# Same matcher-group + inner-hooks shape as Claude Code. We:
+#   1. Strip any stale top-level `SessionStart` from the pre-fix install
+#      (wrong shape that Codex silently ignored).
+#   2. Surgically strip any of our commands (matched by stable suffix,
+#      not exact path — see the Claude Code section for the rationale)
+#      from existing matcher groups, preserving sibling hooks the user
+#      may have placed alongside ours.
+#   3. Append a fresh group containing just ours with the current path.
+jq --arg cmd "$cx_hook" --arg sig "/adapters/codex-cli/hooks/surface-handoffs.sh" '
+  del(.SessionStart)
+  | (.hooks // {}) as $hooks
+  | ($hooks.SessionStart // []) as $arr
+  | ($arr | map(
+      .hooks = ([.hooks // [] | .[] | select(((.command // "") | endswith($sig)) | not)])
+      | select((.hooks | length) > 0)
+    )) as $pruned
+  | .hooks = ($hooks | .SessionStart = (
+      $pruned + [{"hooks": [{"type":"command","command":$cmd}]}]
+    ))
+' "$cx_settings" > "$cx_tmp"
+mv "$cx_tmp" "$cx_settings"
+trap - EXIT
+
+printf 'wired codex-cli hook into %s\n' "$cx_settings"
+
+###############################################################################
+# Success banner
+###############################################################################
+
+cat <<EOF
+
+agent-handoff installed globally.
+
+  * Claude Code skill:    ~/.claude/skills/handoff -> $cc_skill_src
+  * Codex CLI plugin:     ~/.codex/plugins/agent-handoff -> $cx_plugin_src
+  * Claude Code hook:     wired into $cc_settings
+  * Codex CLI hook:       wired into $cx_settings
+
+SessionStart hooks now fire in every project automatically — no
+per-project install needed. The hook is a silent no-op in projects
+without pending handoffs.
+EOF

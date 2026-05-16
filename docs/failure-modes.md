@@ -74,9 +74,12 @@ straightforward to add.)
 
 **Diagnose.**
 
-1. Confirm `bin/install-into-project` was run for the project.
-2. Confirm `.claude/settings.json` (or `.codex/hooks.json`) lists the
-   absolute path of the hook.
+1. Confirm `bin/install` was run (one-time, global). The user-level
+   hooks live in `~/.claude/settings.json` and `~/.codex/hooks.json`.
+2. Confirm those files list the absolute path of the hook under
+   `.hooks.SessionStart[*].hooks[*].command`. A project may additionally
+   wire the hook into `.claude/settings.json` / `.codex/hooks.json` —
+   if so, that overlay takes precedence; either source works.
 3. Run the hook by hand: `bash /path/to/surface-handoffs.sh`. If it
    prints output, the hook works but isn't being invoked by the agent
    tool.

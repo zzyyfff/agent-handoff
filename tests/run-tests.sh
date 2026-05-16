@@ -1105,6 +1105,59 @@ test_install_creates_codex_plugin_symlink() {
   assert_eq "$target" "$expected" "codex plugin symlink points at adapters/codex-cli"
 }
 
+test_install_removes_prior_install_from_different_repo_path() {
+  # Critical: if a user moves the repo, clones a second copy, or runs
+  # from a different worktree, the OLD absolute path must be removed
+  # rather than left behind as a dead-or-duplicate hook on every session
+  # in every project. Match by stable suffix, not exact path.
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  # Seed both files with hooks from a DIFFERENT repo location — same
+  # suffix, different prefix.
+  cat > "$HOME/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/old/clone/of/agent-handoff/adapters/claude-code/hooks/surface-handoffs.sh"}]}
+    ]
+  }
+}
+EOF
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/old/clone/of/agent-handoff/adapters/codex-cli/hooks/surface-handoffs.sh"}]}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install" >/dev/null
+  # Old absolute path should be gone from both.
+  local cc_old
+  cc_old="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                 | select(.command | startswith("/old/clone"))] | length' \
+              "$HOME/.claude/settings.json")"
+  assert_eq "$cc_old" "0" "claude-code: stale absolute path from prior repo location removed"
+  local cx_old
+  cx_old="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                 | select(.command | startswith("/old/clone"))] | length' \
+              "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_old" "0" "codex-cli: stale absolute path from prior repo location removed"
+  # Exactly one current entry should exist in each.
+  local cc_count cx_count
+  cc_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select((.command//"") | endswith("/adapters/claude-code/hooks/surface-handoffs.sh"))]
+                 | length' "$HOME/.claude/settings.json")"
+  assert_eq "$cc_count" "1" "claude-code: exactly one current entry after migration"
+  cx_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select((.command//"") | endswith("/adapters/codex-cli/hooks/surface-handoffs.sh"))]
+                 | length' "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_count" "1" "codex-cli: exactly one current entry after migration"
+}
+
 test_install_is_idempotent_for_symlinks() {
   "$repo_root/bin/install" >/dev/null
   "$repo_root/bin/install" >/dev/null
@@ -1175,6 +1228,7 @@ tests=(
   test_install_wraps_unrelated_flat_claude_code_entries
   test_install_creates_skill_symlink
   test_install_creates_codex_plugin_symlink
+  test_install_removes_prior_install_from_different_repo_path
   test_install_is_idempotent_for_symlinks
 )
 

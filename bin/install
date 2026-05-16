@@ -112,22 +112,29 @@ trap 'rm -f "$cc_tmp"' EXIT
 # received undefined".
 #
 # Migration / idempotency:
-# - Well-formed matcher groups: surgically remove our command from the
-#   inner hooks array; drop the group only if it becomes empty.
+# - Match by stable signature, not exact path. The current install may
+#   live at a different absolute path than a prior install (repo moved,
+#   second clone, worktree refactor); pruning by suffix removes the
+#   stale entry instead of leaving a dead absolute path that errors on
+#   every session in every project. We anchor on
+#   `/adapters/claude-code/hooks/surface-handoffs.sh` — uniquely ours,
+#   no collisions with other tools.
+# - Well-formed matcher groups: surgically remove any of our commands
+#   from the inner hooks array; drop the group only if it becomes empty.
 # - Pre-fix flat entries: if ours, drop; if someone else's, wrap into a
 #   valid matcher group so the user's other broken-pre-fix hooks recover
 #   automatically rather than getting silently lost.
-# - Then append our canonical group.
-jq --arg cmd "$cc_hook" '
+# - Then append our canonical group with the current absolute path.
+jq --arg cmd "$cc_hook" --arg sig "/adapters/claude-code/hooks/surface-handoffs.sh" '
   . as $orig
   | (.hooks // {}) as $hooks
   | ($hooks.SessionStart // []) as $arr
   | ($arr | map(
       if (.hooks // null) != null then
-        .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+        .hooks = ([.hooks // [] | .[] | select(((.command // "") | endswith($sig)) | not)])
         | select((.hooks | length) > 0)
       elif (.type and .command) then
-        if .command == $cmd then empty
+        if (.command | endswith($sig)) then empty
         else {"hooks": [.]}
         end
       else
@@ -169,15 +176,17 @@ trap 'rm -f "$cx_tmp"' EXIT
 # Same matcher-group + inner-hooks shape as Claude Code. We:
 #   1. Strip any stale top-level `SessionStart` from the pre-fix install
 #      (wrong shape that Codex silently ignored).
-#   2. Surgically strip our command from existing matcher groups,
-#      preserving sibling hooks the user may have placed alongside ours.
-#   3. Append a fresh group containing just ours.
-jq --arg cmd "$cx_hook" '
+#   2. Surgically strip any of our commands (matched by stable suffix,
+#      not exact path — see the Claude Code section for the rationale)
+#      from existing matcher groups, preserving sibling hooks the user
+#      may have placed alongside ours.
+#   3. Append a fresh group containing just ours with the current path.
+jq --arg cmd "$cx_hook" --arg sig "/adapters/codex-cli/hooks/surface-handoffs.sh" '
   del(.SessionStart)
   | (.hooks // {}) as $hooks
   | ($hooks.SessionStart // []) as $arr
   | ($arr | map(
-      .hooks = ([.hooks // [] | .[] | select((.command // "") != $cmd)])
+      .hooks = ([.hooks // [] | .[] | select(((.command // "") | endswith($sig)) | not)])
       | select((.hooks | length) > 0)
     )) as $pruned
   | .hooks = ($hooks | .SessionStart = (

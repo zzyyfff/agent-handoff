@@ -599,6 +599,97 @@ test_surface_all_recovers_stale_claim_from_dead_pid() {
   fi
 }
 
+test_surface_all_preserves_caller_exit_trap() {
+  # The self-heal trap is installed mid-function and removed on clean
+  # exit. It MUST NOT silently drop the caller's pre-existing EXIT
+  # trap (which might be doing lock release, tmp-dir cleanup, etc).
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  write_sample_handoff "$f"
+
+  local sentinel="$AGENT_HANDOFF_ROOT/caller-trap-fired"
+  # Install caller trap BEFORE the surface_all call.
+  trap 'touch "'"$sentinel"'"' EXIT
+  agent_handoff_surface_all 1 >/dev/null 2>&1
+  # After surface_all returns cleanly, the caller's trap should still
+  # be the active EXIT trap. We can't easily inspect the actual trap
+  # value portably in bash 3.2, so we trigger an exit from a subshell
+  # to verify the trap survives.
+  (
+    trap 'touch "'"$sentinel"'"' EXIT
+    agent_handoff_surface_all 1 >/dev/null 2>&1
+    # Subshell exits here; if the trap was preserved, the sentinel
+    # is created.
+  )
+  if [[ ! -e "$sentinel" ]]; then
+    printf '   caller EXIT trap was dropped by surface_all\n' >&2
+    exit 1
+  fi
+  # Clean up our top-level trap so it doesn't fire during test
+  # harness teardown.
+  trap - EXIT
+}
+
+test_unwind_trap_does_not_overwrite_fresh_handoff() {
+  # Scenario: the hook claims unread/foo.md (rename to .claim-PID-foo.md),
+  # then a NEW handoff arrives under unread/foo.md (e.g. a writer just
+  # got there), then the hook is killed mid-loop. The trap must not
+  # `mv` the claim back over the new handoff — it must use safe_rename
+  # and land at a suffixed path instead.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local unread_dir="$AGENT_HANDOFF_ROOT/_fake/assistant/unread"
+  local orig_name="20260516T100000Z-from-sender.md"
+  local f="$unread_dir/$orig_name"
+  write_sample_handoff "$f"
+
+  # Simulate a fresh handoff arriving under <orig> AFTER our claim.
+  # We do this by monkey-patching stamp_received_at to write a sentinel
+  # at $unread_dir/$orig_name (mimicking a writer's atomic_write
+  # landing) and then exit, leaving our claim still in place.
+  agent_handoff_stamp_received_at() {
+    printf 'FRESH_HANDOFF_FROM_NEW_WRITER\n' > "$unread_dir/$orig_name"
+    exit 1
+  }
+
+  if ( agent_handoff_surface_all 1 >/dev/null 2>&1 ); then
+    printf '   expected surface_all to fail under simulated kill\n' >&2
+    exit 1
+  fi
+
+  # The fresh handoff at $unread_dir/$orig_name must be untouched.
+  local fresh
+  fresh="$(cat "$unread_dir/$orig_name" 2>/dev/null || echo MISSING)"
+  assert_eq "$fresh" "FRESH_HANDOFF_FROM_NEW_WRITER" \
+    "fresh handoff at orig name preserved (trap did not clobber via raw mv)"
+
+  # The unwound claim should have landed at a hex-suffixed name.
+  shopt -s nullglob
+  local suffixed=("$unread_dir"/*.md)
+  shopt -u nullglob
+  local found_suffixed=0
+  local file
+  for file in "${suffixed[@]}"; do
+    [[ "$(basename -- "$file")" == "$orig_name" ]] && continue
+    found_suffixed=1
+  done
+  if [[ "$found_suffixed" -eq 0 ]]; then
+    printf '   expected a hex-suffixed restored file in %s, got: %s\n' \
+      "$unread_dir" "${suffixed[*]}" >&2
+    exit 1
+  fi
+
+  # And no claim file should remain.
+  shopt -s nullglob
+  local leftover=("$unread_dir"/.claim-*)
+  shopt -u nullglob
+  if [[ ${#leftover[@]} -gt 0 ]]; then
+    printf '   trap left stuck claim: %s\n' "${leftover[*]}" >&2
+    exit 1
+  fi
+}
+
 test_surface_all_self_heals_after_interrupted_loop() {
   # If THIS hook gets killed mid-loop (e.g. SIGPIPE from a stdout
   # reader that closed early — see the live `… | head -10` hit), the
@@ -1080,6 +1171,8 @@ tests=(
   test_surface_all_skips_live_preclaimed_file
   test_surface_all_recovers_stale_claim_from_dead_pid
   test_surface_all_self_heals_after_interrupted_loop
+  test_surface_all_preserves_caller_exit_trap
+  test_unwind_trap_does_not_overwrite_fresh_handoff
   test_atomic_write_returns_landing_path
   test_atomic_write_collision_appends_hex_suffix
   test_atomic_write_does_not_overwrite_via_helper

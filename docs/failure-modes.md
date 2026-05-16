@@ -173,6 +173,34 @@ Manual recovery is still possible if needed:
 `mv unread/.claim-<pid>-<base> unread/<base>` — or move it to
 `read/<base>` if already internalised.
 
+**Residual edge cases.** The PID-based liveness check has two well-known
+weaknesses that are mitigated but not eliminated:
+
+- *PID reuse.* If the killed hook's PID is reused by an unrelated
+  long-lived process (system daemon, screen session) before the next
+  hook runs, the sweep treats the claim as live and leaves it. Mitigation:
+  any PID below 100 (init/system daemons, rarely a real hook owner)
+  is treated as "fabricated" and recovered anyway. PIDs in the typical
+  user range that get reused are not auto-recovered — manual
+  intervention is the fallback.
+
+- *Shared `AGENT_HANDOFF_ROOT` across hosts (NFS, network mounts).* The
+  PID space is per-host. A sweep on host B sees host A's PIDs as "not
+  alive" and may restore a claim that host A is still actively
+  processing — risking a double-surface. Conversely, a dead PID on
+  host A may collide with a live PID on host B and remain stuck.
+  agent-handoff is designed for the single-host common case;
+  multi-host sharing is not in v1 scope. If you do share `~/.agent-handoffs/`,
+  ensure only one host runs the receiver hooks.
+
+Concurrent recovery sweeps (two hooks racing to recover the same stale
+claim) are made race-safe by re-claiming under our own PID via atomic
+mv before restoring — only one sweeper wins the rename per stale file.
+The trap-based self-heal uses `safe_rename` rather than raw `mv`, so
+a fresh handoff that landed under the original basename after our
+claim is never silently overwritten — the restored claim lands at
+`<orig>-<hex>.md` instead.
+
 ## Recipient path traversal
 
 **Symptom.** A handoff written with `--to ../../../etc/passwd` or a

@@ -297,6 +297,14 @@ agent_handoff_sanitize_field() {
 # invocation (the caller runs this before list_unread). Live claims
 # are left alone — a sibling hook may still be working on them.
 #
+# Concurrency: two recovery sweeps running concurrently MUST NOT both
+# restore the same stale claim (that would hardlink the source to two
+# names before either removes the source, producing a duplicate
+# handoff). To prevent that, we re-claim each stale file under OUR PID
+# via an atomic mv first — only one sweeper wins. The loser's mv fails
+# and it skips the entry. The winner then restores from its own-PID
+# claim path.
+#
 # Silent on success; no output. Returns 0 always (the caller should not
 # fail just because there are no stale claims to recover).
 agent_handoff_recover_stale_claims() {
@@ -304,7 +312,7 @@ agent_handoff_recover_stale_claims() {
   if [[ ! -d "$dir" ]]; then
     return 0
   fi
-  local f base pid rest orig
+  local f base pid rest orig my_claim
   shopt -s nullglob
   for f in "$dir"/.claim-*; do
     [[ -L "$f" ]] && continue
@@ -326,15 +334,29 @@ agent_handoff_recover_stale_claims() {
       ''|*[!0-9]*) continue ;;
     esac
     agent_handoff_validate_basename "$orig" 2>/dev/null || continue
-    # Live PID? Leave it — a sibling hook owns it.
-    if kill -0 "$pid" 2>/dev/null; then
+    # An attacker (or accident) with write access to the inbox could
+    # fabricate `.claim-1-<orig>` to hide a handoff indefinitely. PID 1
+    # is always live on a typical system, so we'd never recover it.
+    # As a small mitigation, refuse to honor PIDs below 100 as
+    # "ownership" — they're either init/system daemons (very unlikely
+    # to be the actual hook owner) or fabricated. For low PIDs we
+    # always proceed to recovery.
+    if [[ "$pid" -ge 100 ]] && kill -0 "$pid" 2>/dev/null; then
+      # Live PID and plausibly a real hook — leave it.
       continue
     fi
-    # Dead PID — restore. agent_handoff_safe_rename handles the case
-    # where `<dir>/<orig>` already exists (a fresh handoff arrived
-    # under the original name after the crash) by appending a hex
-    # suffix, so we never silently clobber.
-    agent_handoff_safe_rename "$f" "$dir/$orig" >/dev/null 2>&1 || true
+    # Dead PID (or low/fabricated PID). Race-safe handoff: re-claim
+    # under OUR PID via atomic mv. If a sibling sweeper got here
+    # first, our mv fails and we skip — it will handle the recovery.
+    my_claim="$dir/.claim-$$-$orig"
+    if ! mv -- "$f" "$my_claim" 2>/dev/null; then
+      continue
+    fi
+    # We now own the file. Restore to its original name. safe_rename
+    # handles the case where `<dir>/<orig>` already exists (a fresh
+    # handoff arrived under the original name after the crash) by
+    # appending a hex suffix — never silently clobber.
+    agent_handoff_safe_rename "$my_claim" "$dir/$orig" >/dev/null 2>&1 || true
   done
   shopt -u nullglob
 }
@@ -428,20 +450,35 @@ agent_handoff_surface_all() {
   # the pending_claims slots so this is a no-op. On signal-interrupted
   # exit (SIGPIPE/SIGTERM/etc) the trap restores anything still pending.
   #
-  # `_idx` is declared local in the function but the trap fires in this
-  # function's scope, so the local pending_* arrays are still in scope.
-  # The trap body is intentionally simple — no helpers, no subshells —
-  # so it can run during shell teardown.
+  # The trap fires in this function's scope (bash runs the EXIT trap
+  # before the function's locals go out of scope when the shell exits
+  # mid-function via `set -e` or a signal), so the local pending_*
+  # arrays are still accessible.
+  #
+  # Caller's existing EXIT trap is saved and restored — we MUST NOT
+  # silently drop a caller's cleanup (lock release, tmp-dir rm, etc).
+  local _prev_exit_trap
+  _prev_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
   agent_handoff_surface_all_unwind() {
-    local _i
+    local _i _cf _orig _udir
+    # Guard against the trap firing AFTER the function has returned
+    # (in which case `pending_claims` is unbound under `set -u`).
+    # Under our actual usage the function is still on the stack when
+    # the trap fires, but the defensive check costs nothing.
+    if ! declare -p pending_claims >/dev/null 2>&1; then
+      return 0
+    fi
     for (( _i = 0; _i < ${#pending_claims[@]}; _i++ )); do
-      local _cf="${pending_claims[$_i]}"
-      local _orig="${pending_originals[$_i]}"
-      local _udir="${pending_unread[$_i]}"
+      _cf="${pending_claims[$_i]}"
+      _orig="${pending_originals[$_i]}"
+      _udir="${pending_unread[$_i]}"
       [[ -z "$_cf" ]] && continue
       [[ ! -e "$_cf" ]] && continue
-      # Best-effort: ignore failures during teardown.
-      mv -- "$_cf" "$_udir/$_orig" 2>/dev/null || true
+      # Use safe_rename so we never silently overwrite a fresh handoff
+      # that arrived under <orig> after we claimed: ours lands as
+      # `<orig>-<hex>.md` instead of clobbering the new one. Suppress
+      # all output — we're in shell-teardown context.
+      agent_handoff_safe_rename "$_cf" "$_udir/$_orig" >/dev/null 2>&1 || true
     done
   }
   trap 'agent_handoff_surface_all_unwind' EXIT
@@ -499,8 +536,15 @@ agent_handoff_surface_all() {
     printf '\n=== %d handoff(s) archived to read/ ===\n\n' "$total"
   } >&"$out_fd"
 
-  # Clean completion: drop the trap so it does not fire on the caller's
-  # normal exit (which would be a no-op given the array is empty, but
-  # leaving live traps around for callers is impolite).
+  # Clean completion: restore the caller's previous EXIT trap (or
+  # clear ours if there was none). Leaving our self-heal installed for
+  # the caller would let it fire on the caller's exit; silently
+  # dropping a caller's existing cleanup would be a regression. Reset
+  # via `trap -` first so the eval starts from a clean slate, then
+  # eval whatever the previous trap was (eval is the documented way to
+  # restore a `trap -p` snapshot).
   trap - EXIT
+  if [[ -n "$_prev_exit_trap" ]]; then
+    eval "$_prev_exit_trap"
+  fi
 }

@@ -137,11 +137,66 @@ silently skipped by the losing hook (the winner still surfaces it
 exactly once). `list_unread` skips dotfiles, so a parallel hook does
 not re-list a claimed file.
 
-**Stuck claim.** If a hook is killed (`SIGKILL`, panic) between claiming
-a file and finishing the archive, the file remains as
-`unread/.claim-<dead-pid>-<basename>` and is invisible to subsequent
-hooks. Recovery is manual: `mv unread/.claim-<pid>-<base> unread/<base>`
-or move it to `read/<base>` if already internalised.
+**Stuck claim — auto-recovered on next invocation.** If a hook is
+killed (`SIGPIPE` from a stdout reader that closed early, e.g.
+`surface-handoffs.sh | head -10`; `SIGKILL`; panic mid-archive)
+between claiming a file and finishing the archive, the file remains
+as `unread/.claim-<dead-pid>-<basename>`. Subsequent hooks would
+ignore it on their own (`list_unread` skips dotfiles, by design, for
+race-safety against sibling hooks) and the handoff would be silently
+lost until manual cleanup.
+
+**Recovery sweep on entry.** Every `agent_handoff_surface_all` call
+first scans `unread/` for `.claim-<pid>-*` files via
+`agent_handoff_recover_stale_claims`. For each, it probes the PID
+with `kill -0`. If the PID is no longer a live process, the file is
+renamed back to its original basename (the `.claim-<pid>-` prefix is
+dropped). The restored file is then picked up by the normal surface
+flow in the same invocation. Live PIDs are left alone — a sibling
+hook may still be working on them.
+
+**No in-process self-heal.** An earlier design tried to install an
+`EXIT` trap inside `agent_handoff_surface_all` that would restore the
+function's still-pending claims on signal-driven teardown. The trap
+fires after the function's `local` arrays have already gone out of
+scope, so the restore loop was a no-op in practice. The simpler
+"next sweep recovers" model is the one we actually rely on. In
+practice, when a hook crashes the calling session typically keeps
+going (so a fresh hook will not run immediately) — but the next
+session's hook on this worktree will sweep and surface the handoff.
+
+Manual recovery is still possible if needed:
+`mv unread/.claim-<pid>-<base> unread/<base>` — or move it to
+`read/<base>` if already internalised.
+
+**Residual edge cases.** The PID-based liveness check has two well-known
+weaknesses:
+
+- *PID reuse.* If the killed hook's PID is reused by an unrelated
+  long-lived process (system daemon, screen session, language runtime)
+  before the next hook runs, the sweep treats the claim as live and
+  leaves it. The earlier "PID < 100 is fabricated, recover anyway"
+  shortcut was removed because containers, devcontainers, and some
+  CI environments hand out low PIDs to real processes — recovering
+  them risked clobbering a live sibling's claim. PID reuse on a busy
+  host is now strictly a manual-recovery case.
+
+- *Shared `AGENT_HANDOFF_ROOT` across hosts (NFS, network mounts).* The
+  PID space is per-host. A sweep on host B sees host A's PIDs as "not
+  alive" and may restore a claim that host A is still actively
+  processing — risking a double-surface. Conversely, a dead PID on
+  host A may collide with a live PID on host B and remain stuck.
+  agent-handoff is designed for the single-host common case;
+  multi-host sharing is not in v1 scope. If you do share `~/.agent-handoffs/`,
+  ensure only one host runs the receiver hooks.
+
+Concurrent recovery sweeps (two hooks racing to recover the same stale
+claim) are made race-safe by re-claiming under our own PID via atomic
+mv before restoring — only one sweeper wins the rename per stale file.
+The restore then uses `safe_rename` rather than raw `mv`, so a fresh
+handoff that landed under the original basename after the prior crash
+is never silently overwritten — the restored claim lands at
+`<orig>-<hex>.md` instead.
 
 ## Recipient path traversal
 

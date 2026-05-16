@@ -528,19 +528,210 @@ test_surface_all_strips_ansi_in_field() {
   fi
 }
 
-test_surface_all_skips_preclaimed_file() {
-  # Simulates a sibling hook that has already claimed the file: the
-  # current hook's mv will fail and the file should be silently skipped.
+test_surface_all_skips_live_preclaimed_file() {
+  # Simulates a sibling hook that has already claimed the file AND is
+  # still alive (PID maps to a live process): the current hook's
+  # recovery sweep must leave it alone, and list_unread skips dotfiles,
+  # so the file should be silently untouched.
   setup_fake_worktree assistant
   agent_handoff_ensure_inbox _fake assistant
-  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-99999-foo.md"
+  # $$ inside this subshell is the running test shell — guaranteed live
+  # for the duration of the test (vs the original test's hardcoded
+  # 99999, which is almost always dead and would now be recovered by
+  # the stale-claim sweep).
+  local live_pid=$$
+  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-${live_pid}-foo.md"
   write_sample_handoff "$pre"
   local out
   out="$(agent_handoff_surface_all 1 2>&1)"
-  # Dotfiles are not listed in the first place, so output should be empty
-  # and the pre-claimed file untouched.
-  assert_eq "$out" "" "pre-claimed dotfile not surfaced"
+  # Dotfiles are not listed in the first place, and the sweep saw the
+  # PID is alive — so output should be empty and the claim untouched.
+  assert_eq "$out" "" "live pre-claimed dotfile not surfaced"
   assert_file_exists "$pre"
+}
+
+test_surface_all_recovers_stale_claim_from_dead_pid() {
+  # A claim file left over from a hook that died (SIGPIPE, SIGKILL,
+  # panic) before it could archive must be recovered and surfaced.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  # Grab a guaranteed-dead PID: spawn a sleep 0 in the background, wait
+  # for it to exit, then reuse its PID. PID reuse is technically
+  # possible but extremely unlikely in the millisecond-scale window of
+  # a unit test.
+  local dead_pid
+  ( sleep 0 ) &
+  dead_pid=$!
+  wait "$dead_pid" 2>/dev/null || true
+  # Belt-and-suspenders: confirm it's actually dead before we rely on it.
+  if kill -0 "$dead_pid" 2>/dev/null; then
+    printf '   sleep 0 still alive at pid %d — flaky env?\n' "$dead_pid" >&2
+    exit 1
+  fi
+  local orig_name="20260516T100000Z-from-sender.md"
+  local stuck="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-${dead_pid}-${orig_name}"
+  write_sample_handoff "$stuck"
+
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+
+  # The stuck file is gone from unread/ (under both names).
+  if [[ -e "$stuck" ]]; then
+    printf '   stale claim should have been swept: %s\n' "$stuck" >&2
+    exit 1
+  fi
+  if [[ -e "$AGENT_HANDOFF_ROOT/_fake/assistant/unread/$orig_name" ]]; then
+    printf '   recovered file should also be archived, not lingering in unread\n' >&2
+    exit 1
+  fi
+  # The handoff was surfaced.
+  assert_contains "$out" "Test handoff" "recovered handoff was surfaced"
+  assert_contains "$out" "1 UNTRUSTED handoff(s) for assistant" "header counts the recovered file"
+  # It landed in read/ under its original name.
+  local archived="$AGENT_HANDOFF_ROOT/_fake/assistant/read/$orig_name"
+  assert_file_exists "$archived"
+  # received_at was stamped.
+  local rcv
+  rcv="$(agent_handoff_read_frontmatter_field "$archived" received_at)"
+  if [[ -z "$rcv" ]]; then
+    printf '   received_at not stamped on recovered file\n' >&2
+    exit 1
+  fi
+}
+
+test_surface_all_skips_pid_zero_claim() {
+  # `.claim-0-<orig>.md` would otherwise stick forever: `kill -0 0`
+  # signals the entire process group and always succeeds, so the
+  # sweep would treat PID 0 as "live" indefinitely. We special-case
+  # all-zero PIDs and skip recovery for them.
+  #
+  # No real hook ever owns PID 0, so the file is unrecoverable
+  # automatically — leaving it in place lets a human notice and
+  # decide what to do (likely a hand-edited or malicious file).
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local orig_name="20260516T100000Z-from-sender.md"
+  local stuck="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-0-${orig_name}"
+  write_sample_handoff "$stuck"
+
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+
+  # File still in unread/ under the .claim-0- name (not recovered).
+  assert_file_exists "$stuck"
+  # Nothing surfaced (the file remained a dotfile and was not picked up).
+  assert_eq "$out" "" "no output when only a .claim-0-* file exists"
+}
+
+test_surface_all_does_not_clobber_caller_exit_trap() {
+  # surface_all no longer installs an EXIT trap (the in-process
+  # self-heal was removed — recovery is handled by the next-invocation
+  # sweep in agent_handoff_recover_stale_claims). This test pins the
+  # invariant: a caller's pre-existing EXIT trap must survive a call
+  # to surface_all unchanged.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
+  write_sample_handoff "$f"
+
+  local sentinel="$AGENT_HANDOFF_ROOT/caller-trap-fired"
+  # Verify in a subshell that the caller's trap fires on subshell exit.
+  (
+    trap 'touch "'"$sentinel"'"' EXIT
+    agent_handoff_surface_all 1 >/dev/null 2>&1
+    # Subshell exits here; if the trap was preserved, the sentinel
+    # is created.
+  )
+  if [[ ! -e "$sentinel" ]]; then
+    printf '   caller EXIT trap was dropped by surface_all\n' >&2
+    exit 1
+  fi
+}
+
+test_surface_all_leaves_stuck_claim_for_next_sweep_to_recover() {
+  # When THIS hook is killed mid-loop, the leftover .claim-<our-pid>-<orig>
+  # dotfile is NOT cleaned up in-process (the EXIT-trap self-heal was
+  # removed — it didn't work portably with local arrays). Instead, the
+  # NEXT invocation's recover_stale_claims sweep finds the claim,
+  # observes our PID is dead via `kill -0`, and restores it. This test
+  # pins the two-step recovery contract: simulated crash leaves a stuck
+  # claim, second surface_all call finds + surfaces it.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local unread_dir="$AGENT_HANDOFF_ROOT/_fake/assistant/unread"
+  local f1="$unread_dir/20260516T100000Z-from-sender-aaa.md"
+  local f2="$unread_dir/20260516T100001Z-from-sender-bbb.md"
+  write_sample_handoff "$f1"
+  write_sample_handoff "$f2"
+
+  # Run the crashing invocation as a NEW bash process (not a subshell)
+  # so `$$` inside it is the crashed process's own PID — which becomes
+  # dead after the process exits, enabling the next sweep to detect it
+  # via `kill -0`. A `( ... )` subshell would leak `$$` from the
+  # parent test shell, which stays alive and would defeat the sweep.
+  local crash_script="$AGENT_HANDOFF_ROOT/_crash.sh"
+  cat > "$crash_script" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+source "$repo_root/lib/slug.sh"
+source "$repo_root/lib/inbox.sh"
+export AGENT_HANDOFF_ROOT="$AGENT_HANDOFF_ROOT"
+agent_handoff_resolve_root() { printf '%s' "\$AGENT_HANDOFF_ROOT/_fake/assistant"; }
+agent_handoff_worktree_basename() { printf 'assistant'; }
+agent_handoff_canonical_slug() { printf '_fake'; }
+agent_handoff_stamp_received_at_call_count=0
+agent_handoff_stamp_received_at() {
+  agent_handoff_stamp_received_at_call_count=\$((agent_handoff_stamp_received_at_call_count + 1))
+  if [[ "\$agent_handoff_stamp_received_at_call_count" -ge 2 ]]; then
+    exit 1
+  fi
+  return 0
+}
+agent_handoff_surface_all 1 >/dev/null 2>&1
+EOF
+  chmod +x "$crash_script"
+  bash "$crash_script" >/dev/null 2>&1
+  local crash_status=$?
+  # The crash script exits non-zero from the simulated kill. If it
+  # somehow succeeded, the test setup is wrong.
+  if [[ $crash_status -eq 0 ]]; then
+    printf '   expected crash script to exit non-zero, got 0\n' >&2
+    exit 1
+  fi
+
+  # At least one stuck claim should remain (the second file's claim
+  # was never restored because the in-process trap is gone). It's the
+  # next sweep's job to recover it.
+  shopt -s nullglob
+  local leftover=("$unread_dir"/.claim-*)
+  shopt -u nullglob
+  if [[ ${#leftover[@]} -eq 0 ]]; then
+    printf '   expected at least one stuck claim left by crashed hook\n' >&2
+    exit 1
+  fi
+
+  # Now a fresh invocation runs the recovery sweep, picks up the
+  # restored file(s), and surfaces them. Every handoff must end up
+  # archived in read/ — none stuck as claims.
+  agent_handoff_surface_all 1 >/dev/null 2>&1
+
+  shopt -s nullglob
+  local after=("$unread_dir"/.claim-*)
+  shopt -u nullglob
+  if [[ ${#after[@]} -gt 0 ]]; then
+    printf '   stuck claims survived the recovery sweep: %s\n' "${after[*]}" >&2
+    exit 1
+  fi
+
+  shopt -s nullglob
+  local unread_left=("$unread_dir"/*.md)
+  local archived=("$AGENT_HANDOFF_ROOT/_fake/assistant/read"/*.md)
+  shopt -u nullglob
+  if [[ ${#unread_left[@]} -gt 0 ]]; then
+    printf '   files left in unread/ after recovery: %s\n' "${unread_left[*]}" >&2
+    exit 1
+  fi
+  assert_eq "${#archived[@]}" "2" "both handoffs end up archived after the recovery sweep"
 }
 
 ###############################################################################
@@ -960,7 +1151,11 @@ tests=(
   test_list_unread_skips_symlinks
   test_surface_all_strips_ansi_in_body
   test_surface_all_strips_ansi_in_field
-  test_surface_all_skips_preclaimed_file
+  test_surface_all_skips_live_preclaimed_file
+  test_surface_all_recovers_stale_claim_from_dead_pid
+  test_surface_all_skips_pid_zero_claim
+  test_surface_all_leaves_stuck_claim_for_next_sweep_to_recover
+  test_surface_all_does_not_clobber_caller_exit_trap
   test_atomic_write_returns_landing_path
   test_atomic_write_collision_appends_hex_suffix
   test_atomic_write_does_not_overwrite_via_helper

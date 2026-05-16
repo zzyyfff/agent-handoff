@@ -599,23 +599,19 @@ test_surface_all_recovers_stale_claim_from_dead_pid() {
   fi
 }
 
-test_surface_all_preserves_caller_exit_trap() {
-  # The self-heal trap is installed mid-function and removed on clean
-  # exit. It MUST NOT silently drop the caller's pre-existing EXIT
-  # trap (which might be doing lock release, tmp-dir cleanup, etc).
+test_surface_all_does_not_clobber_caller_exit_trap() {
+  # surface_all no longer installs an EXIT trap (the in-process
+  # self-heal was removed — recovery is handled by the next-invocation
+  # sweep in agent_handoff_recover_stale_claims). This test pins the
+  # invariant: a caller's pre-existing EXIT trap must survive a call
+  # to surface_all unchanged.
   setup_fake_worktree assistant
   agent_handoff_ensure_inbox _fake assistant
   local f="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/20260516T100000Z-from-sender.md"
   write_sample_handoff "$f"
 
   local sentinel="$AGENT_HANDOFF_ROOT/caller-trap-fired"
-  # Install caller trap BEFORE the surface_all call.
-  trap 'touch "'"$sentinel"'"' EXIT
-  agent_handoff_surface_all 1 >/dev/null 2>&1
-  # After surface_all returns cleanly, the caller's trap should still
-  # be the active EXIT trap. We can't easily inspect the actual trap
-  # value portably in bash 3.2, so we trigger an exit from a subshell
-  # to verify the trap survives.
+  # Verify in a subshell that the caller's trap fires on subshell exit.
   (
     trap 'touch "'"$sentinel"'"' EXIT
     agent_handoff_surface_all 1 >/dev/null 2>&1
@@ -626,76 +622,16 @@ test_surface_all_preserves_caller_exit_trap() {
     printf '   caller EXIT trap was dropped by surface_all\n' >&2
     exit 1
   fi
-  # Clean up our top-level trap so it doesn't fire during test
-  # harness teardown.
-  trap - EXIT
 }
 
-test_unwind_trap_does_not_overwrite_fresh_handoff() {
-  # Scenario: the hook claims unread/foo.md (rename to .claim-PID-foo.md),
-  # then a NEW handoff arrives under unread/foo.md (e.g. a writer just
-  # got there), then the hook is killed mid-loop. The trap must not
-  # `mv` the claim back over the new handoff — it must use safe_rename
-  # and land at a suffixed path instead.
-  setup_fake_worktree assistant
-  agent_handoff_ensure_inbox _fake assistant
-  local unread_dir="$AGENT_HANDOFF_ROOT/_fake/assistant/unread"
-  local orig_name="20260516T100000Z-from-sender.md"
-  local f="$unread_dir/$orig_name"
-  write_sample_handoff "$f"
-
-  # Simulate a fresh handoff arriving under <orig> AFTER our claim.
-  # We do this by monkey-patching stamp_received_at to write a sentinel
-  # at $unread_dir/$orig_name (mimicking a writer's atomic_write
-  # landing) and then exit, leaving our claim still in place.
-  agent_handoff_stamp_received_at() {
-    printf 'FRESH_HANDOFF_FROM_NEW_WRITER\n' > "$unread_dir/$orig_name"
-    exit 1
-  }
-
-  if ( agent_handoff_surface_all 1 >/dev/null 2>&1 ); then
-    printf '   expected surface_all to fail under simulated kill\n' >&2
-    exit 1
-  fi
-
-  # The fresh handoff at $unread_dir/$orig_name must be untouched.
-  local fresh
-  fresh="$(cat "$unread_dir/$orig_name" 2>/dev/null || echo MISSING)"
-  assert_eq "$fresh" "FRESH_HANDOFF_FROM_NEW_WRITER" \
-    "fresh handoff at orig name preserved (trap did not clobber via raw mv)"
-
-  # The unwound claim should have landed at a hex-suffixed name.
-  shopt -s nullglob
-  local suffixed=("$unread_dir"/*.md)
-  shopt -u nullglob
-  local found_suffixed=0
-  local file
-  for file in "${suffixed[@]}"; do
-    [[ "$(basename -- "$file")" == "$orig_name" ]] && continue
-    found_suffixed=1
-  done
-  if [[ "$found_suffixed" -eq 0 ]]; then
-    printf '   expected a hex-suffixed restored file in %s, got: %s\n' \
-      "$unread_dir" "${suffixed[*]}" >&2
-    exit 1
-  fi
-
-  # And no claim file should remain.
-  shopt -s nullglob
-  local leftover=("$unread_dir"/.claim-*)
-  shopt -u nullglob
-  if [[ ${#leftover[@]} -gt 0 ]]; then
-    printf '   trap left stuck claim: %s\n' "${leftover[*]}" >&2
-    exit 1
-  fi
-}
-
-test_surface_all_self_heals_after_interrupted_loop() {
-  # If THIS hook gets killed mid-loop (e.g. SIGPIPE from a stdout
-  # reader that closed early — see the live `… | head -10` hit), the
-  # trap-based unwind must restore any not-yet-archived claims back to
-  # their original names in unread/. So when the next hook runs, the
-  # handoff is still there.
+test_surface_all_leaves_stuck_claim_for_next_sweep_to_recover() {
+  # When THIS hook is killed mid-loop, the leftover .claim-<our-pid>-<orig>
+  # dotfile is NOT cleaned up in-process (the EXIT-trap self-heal was
+  # removed — it didn't work portably with local arrays). Instead, the
+  # NEXT invocation's recover_stale_claims sweep finds the claim,
+  # observes our PID is dead via `kill -0`, and restores it. This test
+  # pins the two-step recovery contract: simulated crash leaves a stuck
+  # claim, second surface_all call finds + surfaces it.
   setup_fake_worktree assistant
   agent_handoff_ensure_inbox _fake assistant
   local unread_dir="$AGENT_HANDOFF_ROOT/_fake/assistant/unread"
@@ -704,51 +640,74 @@ test_surface_all_self_heals_after_interrupted_loop() {
   write_sample_handoff "$f1"
   write_sample_handoff "$f2"
 
-  # Monkey-patch one of the inner helpers to die on the SECOND call.
-  # Counter is module-scoped to this subshell.
-  agent_handoff_stamp_received_at_call_count=0
-  agent_handoff_stamp_received_at() {
-    agent_handoff_stamp_received_at_call_count=$((agent_handoff_stamp_received_at_call_count + 1))
-    if [[ "$agent_handoff_stamp_received_at_call_count" -ge 2 ]]; then
-      # Simulate hook being killed mid-loop. `exit 1` from inside the
-      # function exits the surrounding subshell, which is what
-      # SIGPIPE/SIGKILL ultimately does.
-      exit 1
-    fi
-    # First call: behave normally (touch the file to keep the rest of
-    # the archive path happy if it gets there).
-    return 0
-  }
-
-  # Run in a subshell so the simulated kill does not abort the test
-  # harness. Expect non-zero status.
-  if ( agent_handoff_surface_all 1 >/dev/null 2>&1 ); then
-    printf '   expected surface_all to fail under simulated kill\n' >&2
+  # Run the crashing invocation as a NEW bash process (not a subshell)
+  # so `$$` inside it is the crashed process's own PID — which becomes
+  # dead after the process exits, enabling the next sweep to detect it
+  # via `kill -0`. A `( ... )` subshell would leak `$$` from the
+  # parent test shell, which stays alive and would defeat the sweep.
+  local crash_script="$AGENT_HANDOFF_ROOT/_crash.sh"
+  cat > "$crash_script" <<EOF
+#!/usr/bin/env bash
+set -uo pipefail
+source "$repo_root/lib/slug.sh"
+source "$repo_root/lib/inbox.sh"
+export AGENT_HANDOFF_ROOT="$AGENT_HANDOFF_ROOT"
+agent_handoff_resolve_root() { printf '%s' "\$AGENT_HANDOFF_ROOT/_fake/assistant"; }
+agent_handoff_worktree_basename() { printf 'assistant'; }
+agent_handoff_canonical_slug() { printf '_fake'; }
+agent_handoff_stamp_received_at_call_count=0
+agent_handoff_stamp_received_at() {
+  agent_handoff_stamp_received_at_call_count=\$((agent_handoff_stamp_received_at_call_count + 1))
+  if [[ "\$agent_handoff_stamp_received_at_call_count" -ge 2 ]]; then
+    exit 1
+  fi
+  return 0
+}
+agent_handoff_surface_all 1 >/dev/null 2>&1
+EOF
+  chmod +x "$crash_script"
+  bash "$crash_script" >/dev/null 2>&1
+  local crash_status=$?
+  # The crash script exits non-zero from the simulated kill. If it
+  # somehow succeeded, the test setup is wrong.
+  if [[ $crash_status -eq 0 ]]; then
+    printf '   expected crash script to exit non-zero, got 0\n' >&2
     exit 1
   fi
 
-  # After the trap fires, no `.claim-*` files should remain in unread/.
+  # At least one stuck claim should remain (the second file's claim
+  # was never restored because the in-process trap is gone). It's the
+  # next sweep's job to recover it.
   shopt -s nullglob
   local leftover=("$unread_dir"/.claim-*)
   shopt -u nullglob
-  if [[ ${#leftover[@]} -gt 0 ]]; then
-    printf '   trap failed to restore claims: %s\n' "${leftover[*]}" >&2
+  if [[ ${#leftover[@]} -eq 0 ]]; then
+    printf '   expected at least one stuck claim left by crashed hook\n' >&2
     exit 1
   fi
 
-  # At least one of the original files must be back under its original
-  # name. (One may have been archived to read/ before the kill — that
-  # is fine; the point is no stuck claims are left behind.)
-  local restored_count=0
-  [[ -e "$f1" ]] && restored_count=$((restored_count + 1))
-  [[ -e "$f2" ]] && restored_count=$((restored_count + 1))
+  # Now a fresh invocation runs the recovery sweep, picks up the
+  # restored file(s), and surfaces them. Every handoff must end up
+  # archived in read/ — none stuck as claims.
+  agent_handoff_surface_all 1 >/dev/null 2>&1
+
   shopt -s nullglob
+  local after=("$unread_dir"/.claim-*)
+  shopt -u nullglob
+  if [[ ${#after[@]} -gt 0 ]]; then
+    printf '   stuck claims survived the recovery sweep: %s\n' "${after[*]}" >&2
+    exit 1
+  fi
+
+  shopt -s nullglob
+  local unread_left=("$unread_dir"/*.md)
   local archived=("$AGENT_HANDOFF_ROOT/_fake/assistant/read"/*.md)
   shopt -u nullglob
-  local total=$((restored_count + ${#archived[@]}))
-  # Every handoff should be accounted for — either back in unread/ or
-  # archived in read/. None can be stuck as a claim.
-  assert_eq "$total" "2" "every handoff is either restored to unread/ or archived to read/"
+  if [[ ${#unread_left[@]} -gt 0 ]]; then
+    printf '   files left in unread/ after recovery: %s\n' "${unread_left[*]}" >&2
+    exit 1
+  fi
+  assert_eq "${#archived[@]}" "2" "both handoffs end up archived after the recovery sweep"
 }
 
 ###############################################################################
@@ -1170,9 +1129,8 @@ tests=(
   test_surface_all_strips_ansi_in_field
   test_surface_all_skips_live_preclaimed_file
   test_surface_all_recovers_stale_claim_from_dead_pid
-  test_surface_all_self_heals_after_interrupted_loop
-  test_surface_all_preserves_caller_exit_trap
-  test_unwind_trap_does_not_overwrite_fresh_handoff
+  test_surface_all_leaves_stuck_claim_for_next_sweep_to_recover
+  test_surface_all_does_not_clobber_caller_exit_trap
   test_atomic_write_returns_landing_path
   test_atomic_write_collision_appends_hex_suffix
   test_atomic_write_does_not_overwrite_via_helper

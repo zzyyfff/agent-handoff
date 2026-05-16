@@ -2,28 +2,28 @@
 
 Two pieces:
 
-- **Skill** at `skill/SKILL.md` — provides `/handoff`. Installed globally
-  by symlinking into `~/.claude/skills/handoff/`.
+- **Skill** at `skill/SKILL.md` — provides `/handoff`. Symlinked into
+  `~/.claude/skills/handoff/`.
 - **Hook** at `hooks/surface-handoffs.sh` — surfaces unread handoffs on
-  SessionStart and archives them. Installed per-project by wiring into
-  `.claude/settings.json`.
+  SessionStart and archives them. Wired into `~/.claude/settings.json`
+  at the user level so it fires for every project automatically.
 
-## Install the skill (one-time, global)
+## Install
 
-```bash
-./bin/install-skill-globally
-```
-
-This symlinks `adapters/claude-code/skill/` to `~/.claude/skills/handoff/`.
-
-## Wire the hook into a project
+From the repo root:
 
 ```bash
-./bin/install-into-project /path/to/project
+./bin/install
 ```
 
-This appends an entry like the following to the project's
-`.claude/settings.json` SessionStart array (creating the file if needed):
+That single command symlinks the skill, symlinks the Codex CLI plugin,
+and wires both hooks at the user level. See the [root README](../../README.md)
+for details. The installer is idempotent.
+
+## What gets wired into `~/.claude/settings.json`
+
+The installer appends an entry like the following to
+`.hooks.SessionStart[]` (creating the file or key if needed):
 
 ```json
 {
@@ -46,8 +46,8 @@ Claude Code at startup with `hooks: Expected array, but received
 undefined`. The installer migrates pre-existing flat entries to the
 correct wrapper.
 
-The hook is idempotent: running the installer twice does not duplicate
-the entry.
+Re-running `bin/install` does not duplicate the entry — the installer
+surgically removes prior agent-handoff entries before re-adding.
 
 ## How they work together
 

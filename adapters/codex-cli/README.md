@@ -10,24 +10,46 @@ Three pieces:
 - **Command** at `commands/handoff.sh` — backs the `/handoff` slash
   command. Emits the canonical procedure (single-sourced from the
   Claude Code skill) so the Codex agent follows the same steps.
-- **AGENTS snippet** at `AGENTS-snippet.md` — copy into your project
-  `AGENTS.md` (or `~/.codex/AGENTS.md`) for belt-and-suspenders coverage.
+- **AGENTS snippet** at `AGENTS-snippet.md` — copy into `~/.codex/AGENTS.md`
+  for belt-and-suspenders coverage.
 
-## Install the plugin
+## Install
+
+From the repo root:
 
 ```bash
-./bin/install-codex-plugin
+./bin/install
 ```
 
-This symlinks `adapters/codex-cli` to `~/.codex/plugins/agent-handoff/`.
-Codex discovers plugins from that directory at startup.
+That single command symlinks this directory into
+`~/.codex/plugins/agent-handoff/`, wires the SessionStart hook into
+`~/.codex/hooks.json` (user-global; loads unconditionally for every
+project), and does the same for the Claude Code adapter. See the
+[root README](../../README.md). Idempotent.
 
-## Wire the hook into a project
+## What gets wired into `~/.codex/hooks.json`
 
-The `./bin/install-into-project /path/to/project` installer wires both
-the Claude Code and Codex CLI hooks. For Codex, this adds an entry to
-the project's `.codex/hooks.json` (or the user-global `~/.codex/hooks.json`
-if no project-local file exists).
+The installer appends an entry like the following to
+`.hooks.SessionStart[]`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {"type": "command", "command": "/abs/path/to/adapters/codex-cli/hooks/surface-handoffs.sh"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+This is the same matcher-group + inner-hooks shape Claude Code uses.
+The installer also strips any pre-fix top-level `SessionStart` key
+(an old shape Codex silently ignored). Re-running `bin/install` does
+not duplicate the entry.
 
 ## Where this differs from the Claude Code adapter
 

@@ -73,22 +73,29 @@ both directions.
 ```bash
 git clone https://github.com/zzyyfff/agent-handoff ~/Developer/tooling/agent-handoff
 cd ~/Developer/tooling/agent-handoff
-
-# Once, globally:
-./bin/install-skill-globally        # Claude Code /handoff skill
-./bin/install-codex-plugin          # Codex CLI /handoff plugin
-
-# Per project (call from the agent-handoff repo dir or pass a path):
-./bin/install-into-project ~/path/to/project
+./bin/install
 ```
 
-`install-into-project` wires the SessionStart hook for both tools into
-the project's settings. It is idempotent — safe to re-run.
+That's it. One command, run once. The installer:
+
+- Symlinks the Claude Code `/handoff` skill into `~/.claude/skills/handoff/`.
+- Symlinks the Codex CLI `/handoff` plugin into `~/.codex/plugins/agent-handoff/`.
+- Wires the SessionStart hook into `~/.claude/settings.json` (user-level).
+- Wires the SessionStart hook into `~/.codex/hooks.json` (user-level).
+
+Both Claude Code and Codex CLI honour user-level hooks for every
+project automatically — no per-project install, no per-worktree
+install, no extra step when you clone a new repo. The hook is a silent
+no-op in projects without pending handoffs.
+
+The installer is idempotent: safe to re-run after a `git pull`, and it
+surgically removes prior agent-handoff entries before re-adding so it
+won't duplicate or fight pre-existing entries it placed itself.
 
 For belt-and-suspenders, paste the block from
-`adapters/codex-cli/AGENTS-snippet.md` into your project's `AGENTS.md`
-(or `~/.codex/AGENTS.md` globally). Claude Code does not read AGENTS.md
-as of May 2026 — for it, add an equivalent block to `~/.claude/CLAUDE.md`.
+`adapters/codex-cli/AGENTS-snippet.md` into your `~/.codex/AGENTS.md`.
+Claude Code does not read AGENTS.md as of May 2026 — for it, add an
+equivalent block to `~/.claude/CLAUDE.md`.
 
 ## Use
 
@@ -129,7 +136,7 @@ agent-handoff/
 ├── adapters/
 │   ├── claude-code/            # /handoff skill + SessionStart hook
 │   └── codex-cli/              # /handoff plugin + SessionStart hook
-├── bin/                        # installer scripts
+├── bin/                        # installer (bin/install)
 ├── docs/
 │   └── failure-modes.md
 ├── examples/

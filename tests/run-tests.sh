@@ -865,51 +865,72 @@ EOF
 }
 
 ###############################################################################
-# install-into-project (Codex JSON shape regression)
+# bin/install — user-level global install
 ###############################################################################
+#
+# bin/install writes to $HOME (which the test harness pins to a tmp dir),
+# so these tests do not pollute the user's real ~/.claude or ~/.codex.
 
-# These tests exercise bin/install-into-project against a fresh fake
-# project dir. They require jq (same as the script itself).
-
-test_install_into_project_writes_correct_codex_format() {
+test_install_writes_correct_claude_code_format() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '   skipping: jq not available\n' >&2; return 0
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project"
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  local codex_settings="$HOME/.codex/hooks.json"
-  assert_file_exists "$codex_settings"
-  # Must be at hooks.SessionStart[*].hooks[*].command (NOT at top-level
-  # .SessionStart[*].script — the pre-fix shape Codex silently ignored).
+  "$repo_root/bin/install" >/dev/null
+  local cc_settings="$HOME/.claude/settings.json"
+  assert_file_exists "$cc_settings"
+  # Per https://code.claude.com/docs/en/hooks each event entry is a
+  # matcher group with an inner `hooks` array. A flat {type,command}
+  # at the SessionStart level is rejected by Claude Code at startup.
   local count
   count="$(jq '[.hooks.SessionStart[]?.hooks[]?
                 | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
-              | length' "$codex_settings")"
-  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart"
-  # The bad top-level SessionStart key should not exist.
-  local bad
-  bad="$(jq 'has("SessionStart")' "$codex_settings")"
-  assert_eq "$bad" "false" "no top-level SessionStart (Codex ignores it)"
-  # The script field shape should not be present anywhere.
-  local script_field
-  script_field="$(jq '[..|.script? // empty] | length' "$codex_settings")"
-  assert_eq "$script_field" "0" "no .script field anywhere (wrong shape)"
+              | length' "$cc_settings")"
+  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart[*].hooks"
+  # No flat {type,command} entries directly at SessionStart.
+  local flat
+  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' "$cc_settings")"
+  assert_eq "$flat" "0" "no flat {type,command} at SessionStart level (wrong shape)"
+  # Every entry under SessionStart must have an inner `hooks` array.
+  local valid total
+  valid="$(jq '[.hooks.SessionStart[]? | select((.hooks|type)=="array")] | length' "$cc_settings")"
+  total="$(jq '.hooks.SessionStart | length' "$cc_settings")"
+  assert_eq "$valid" "$total" "every SessionStart entry has inner hooks array"
 }
 
-test_install_into_project_is_idempotent() {
+test_install_writes_correct_codex_format() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '   skipping: jq not available\n' >&2; return 0
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project"
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
+  "$repo_root/bin/install" >/dev/null
+  local cx_settings="$HOME/.codex/hooks.json"
+  assert_file_exists "$cx_settings"
+  # Same matcher-group + inner-hooks shape required by Codex.
+  local count
+  count="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
+              | length' "$cx_settings")"
+  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart"
+  # The pre-fix top-level SessionStart key must not exist.
+  local bad
+  bad="$(jq 'has("SessionStart")' "$cx_settings")"
+  assert_eq "$bad" "false" "no top-level SessionStart (Codex ignores it)"
+  # No .script field shape anywhere (wrong, pre-fix).
+  local script_field
+  script_field="$(jq '[..|.script? // empty] | length' "$cx_settings")"
+  assert_eq "$script_field" "0" "no .script field anywhere (wrong shape)"
+}
+
+test_install_is_idempotent() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  "$repo_root/bin/install" >/dev/null
+  "$repo_root/bin/install" >/dev/null
+  "$repo_root/bin/install" >/dev/null
   local cc_count cx_count
   cc_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
                    | select((.command//"") | endswith("surface-handoffs.sh"))]
-                 | length' "$project/.claude/settings.json")"
+                 | length' "$HOME/.claude/settings.json")"
   assert_eq "$cc_count" "1" "claude-code: exactly one SessionStart entry after 3 installs"
   cx_count="$(jq '[.hooks.SessionStart[]?.hooks[]?
                    | select((.command//"") | endswith("surface-handoffs.sh"))]
@@ -917,53 +938,123 @@ test_install_into_project_is_idempotent() {
   assert_eq "$cx_count" "1" "codex-cli: exactly one SessionStart entry after 3 installs"
 }
 
-test_install_into_project_writes_correct_claude_code_format() {
+test_install_preserves_unrelated_hooks() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '   skipping: jq not available\n' >&2; return 0
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project"
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  local cc_settings="$project/.claude/settings.json"
-  assert_file_exists "$cc_settings"
-  # Per https://code.claude.com/docs/en/hooks each event entry is a
-  # matcher group with an inner `hooks` array. A flat
-  # {type,command} at the SessionStart level is rejected by
-  # Claude Code at startup with "hooks: Expected array, but received
-  # undefined".
-  local count
-  count="$(jq '[.hooks.SessionStart[]?.hooks[]?
-                | select(.type=="command" and (.command|endswith("surface-handoffs.sh")))]
-              | length' "$cc_settings")"
-  assert_eq "$count" "1" "exactly one SessionStart command under hooks.SessionStart[*].hooks"
-  # No flat {type,command} entries directly at the SessionStart level —
-  # those are the pre-fix shape Claude Code rejects.
-  local flat
-  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' "$cc_settings")"
-  assert_eq "$flat" "0" "no flat {type,command} at SessionStart level (wrong shape)"
-  # Every entry under SessionStart must have an inner `hooks` array.
-  local valid
-  valid="$(jq '[.hooks.SessionStart[]? | select((.hooks|type)=="array")] | length' "$cc_settings")"
-  local total
-  total="$(jq '.hooks.SessionStart | length' "$cc_settings")"
-  assert_eq "$valid" "$total" "every SessionStart entry has inner hooks array"
+  mkdir -p "$HOME/.claude" "$HOME/.codex"
+  # Seed both files with unrelated entries; the installer must preserve them.
+  cat > "$HOME/.claude/settings.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/cc-pre"}]}
+    ],
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/usr/local/bin/cc-other-session"}]}
+    ]
+  }
+}
+EOF
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/cx-pre"}]}
+    ],
+    "SessionStart": [
+      {"hooks":[{"type":"command","command":"/usr/local/bin/cx-other-session"}]}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install" >/dev/null
+  # Claude Code: PreToolUse preserved
+  local cc_pre
+  cc_pre="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.claude/settings.json")"
+  assert_eq "$cc_pre" "/usr/local/bin/cc-pre" "claude-code PreToolUse preserved"
+  # Claude Code: other SessionStart kept alongside ours
+  local cc_other
+  cc_other="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select(.command == "/usr/local/bin/cc-other-session")] | length' \
+              "$HOME/.claude/settings.json")"
+  assert_eq "$cc_other" "1" "claude-code other SessionStart kept alongside agent-handoff"
+  # Codex CLI: PreToolUse preserved
+  local cx_pre
+  cx_pre="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_pre" "/usr/local/bin/cx-pre" "codex-cli PreToolUse preserved"
+  # Codex CLI: other SessionStart kept alongside ours
+  local cx_other
+  cx_other="$(jq '[.hooks.SessionStart[]?.hooks[]?
+                   | select(.command == "/usr/local/bin/cx-other-session")] | length' \
+              "$HOME/.codex/hooks.json")"
+  assert_eq "$cx_other" "1" "codex-cli other SessionStart kept alongside agent-handoff"
 }
 
-test_install_into_project_wraps_unrelated_flat_claude_code_entries() {
-  # A pre-fix install that targeted an unrelated tool may have left a
-  # flat {type,command} entry that wasn't ours. Claude Code rejects the
-  # whole file when any flat entry exists, so the user's other hook
-  # was broken anyway. The installer should migrate it to a valid
-  # wrapper rather than silently dropping it — the user gets a working
-  # config back rather than a half-deleted one.
+test_install_migrates_flat_claude_code_entry() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '   skipping: jq not available\n' >&2; return 0
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project/.claude"
+  mkdir -p "$HOME/.claude"
+  # Pre-fix install wrote flat {type,command} directly under
+  # SessionStart for agent-handoff itself.
+  local stale_cmd
+  stale_cmd="$(cd "$repo_root" && pwd -P)/adapters/claude-code/hooks/surface-handoffs.sh"
+  cat > "$HOME/.claude/settings.json" <<EOF
+{
+  "hooks": {
+    "SessionStart": [
+      {"type": "command", "command": "$stale_cmd"}
+    ]
+  }
+}
+EOF
+  "$repo_root/bin/install" >/dev/null
+  # No flat {type,command} should remain under SessionStart.
+  local flat
+  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' \
+              "$HOME/.claude/settings.json")"
+  assert_eq "$flat" "0" "flat pre-fix entry removed on reinstall"
+  local count
+  count="$(jq --arg c "$stale_cmd" '[.hooks.SessionStart[]?.hooks[]?
+                                     | select(.command == $c)] | length' \
+              "$HOME/.claude/settings.json")"
+  assert_eq "$count" "1" "well-formed entry replaces the flat one"
+}
+
+test_install_migrates_stale_top_level_codex_session_start() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  mkdir -p "$HOME/.codex"
+  # Pre-fix install left a top-level SessionStart with `script` field
+  # (wrong shape that Codex silently ignored).
+  cat > "$HOME/.codex/hooks.json" <<'EOF'
+{
+  "SessionStart": [
+    {"script": "/stale/old/path"}
+  ]
+}
+EOF
+  "$repo_root/bin/install" >/dev/null
+  local has_top_level
+  has_top_level="$(jq 'has("SessionStart")' "$HOME/.codex/hooks.json")"
+  assert_eq "$has_top_level" "false" "stale top-level SessionStart removed on reinstall"
+}
+
+test_install_wraps_unrelated_flat_claude_code_entries() {
+  # A pre-fix install that targeted an unrelated tool may have left a
+  # flat {type,command} entry that wasn't ours. Claude Code rejects the
+  # whole file when any flat entry exists, so the user's other hook was
+  # broken anyway. The installer should migrate it to a valid wrapper
+  # rather than silently dropping it.
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '   skipping: jq not available\n' >&2; return 0
+  fi
+  mkdir -p "$HOME/.claude"
   local our_cmd
   our_cmd="$(cd "$repo_root" && pwd -P)/adapters/claude-code/hooks/surface-handoffs.sh"
-  cat > "$project/.claude/settings.json" <<EOF
+  cat > "$HOME/.claude/settings.json" <<EOF
 {
   "hooks": {
     "SessionStart": [
@@ -973,145 +1064,56 @@ test_install_into_project_wraps_unrelated_flat_claude_code_entries() {
   }
 }
 EOF
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  # No flat entries should remain.
+  "$repo_root/bin/install" >/dev/null
   local flat
   flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' \
-              "$project/.claude/settings.json")"
+              "$HOME/.claude/settings.json")"
   assert_eq "$flat" "0" "no flat entries remain"
-  # The unrelated entry must have been wrapped, not dropped.
   local wrapped
   wrapped="$(jq '[.hooks.SessionStart[]?.hooks[]?
                   | select(.command == "/usr/local/bin/unrelated-flat")]
-                | length' "$project/.claude/settings.json")"
+                | length' "$HOME/.claude/settings.json")"
   assert_eq "$wrapped" "1" "unrelated flat entry migrated into a matcher group"
-  # Our canonical entry present exactly once.
   local our_count
   our_count="$(jq --arg c "$our_cmd" '[.hooks.SessionStart[]?.hooks[]?
                                        | select(.command == $c)] | length' \
-              "$project/.claude/settings.json")"
+              "$HOME/.claude/settings.json")"
   assert_eq "$our_count" "1" "our entry present exactly once"
 }
 
-test_install_into_project_migrates_flat_claude_code_session_start() {
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '   skipping: jq not available\n' >&2; return 0
+test_install_creates_skill_symlink() {
+  "$repo_root/bin/install" >/dev/null
+  local dest="$HOME/.claude/skills/handoff"
+  if [[ ! -L "$dest" ]]; then
+    printf '   expected symlink at %s\n' "$dest" >&2; exit 1
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project/.claude"
-  # Pre-fix install wrote flat {type,command} directly under
-  # SessionStart. Reinstall must drop the broken entry and produce a
-  # well-formed wrapper.
-  local stale_cmd
-  stale_cmd="$(cd "$repo_root" && pwd -P)/adapters/claude-code/hooks/surface-handoffs.sh"
-  cat > "$project/.claude/settings.json" <<EOF
-{
-  "hooks": {
-    "SessionStart": [
-      {"type": "command", "command": "$stale_cmd"}
-    ]
-  }
-}
-EOF
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  # No flat {type,command} should remain under SessionStart.
-  local flat
-  flat="$(jq '[.hooks.SessionStart[]? | select(.type and .command)] | length' \
-              "$project/.claude/settings.json")"
-  assert_eq "$flat" "0" "flat pre-fix entry removed on reinstall"
-  # Exactly one well-formed entry should reference our hook.
-  local count
-  count="$(jq --arg c "$stale_cmd" '[.hooks.SessionStart[]?.hooks[]?
-                                     | select(.command == $c)] | length' \
-              "$project/.claude/settings.json")"
-  assert_eq "$count" "1" "well-formed entry replaces the flat one"
+  local target
+  target="$(readlink "$dest")"
+  local expected="$repo_root/adapters/claude-code/skill"
+  assert_eq "$target" "$expected" "skill symlink points at adapters/claude-code/skill"
 }
 
-test_install_into_project_migrates_stale_top_level_session_start() {
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '   skipping: jq not available\n' >&2; return 0
+test_install_creates_codex_plugin_symlink() {
+  "$repo_root/bin/install" >/dev/null
+  local dest="$HOME/.codex/plugins/agent-handoff"
+  if [[ ! -L "$dest" ]]; then
+    printf '   expected symlink at %s\n' "$dest" >&2; exit 1
   fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project" "$HOME/.codex"
-  # Pre-fix install left a top-level SessionStart with `script` field.
-  cat > "$HOME/.codex/hooks.json" <<'EOF'
-{
-  "SessionStart": [
-    {"script": "/stale/old/path"}
-  ]
-}
-EOF
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  local has_top_level
-  has_top_level="$(jq 'has("SessionStart")' "$HOME/.codex/hooks.json")"
-  assert_eq "$has_top_level" "false" "stale top-level SessionStart removed on reinstall"
+  local target
+  target="$(readlink "$dest")"
+  local expected="$repo_root/adapters/codex-cli"
+  assert_eq "$target" "$expected" "codex plugin symlink points at adapters/codex-cli"
 }
 
-test_install_into_project_preserves_sibling_hook_in_same_group() {
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '   skipping: jq not available\n' >&2; return 0
-  fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project" "$HOME/.codex"
-  # User has manually combined agent-handoff with another hook in ONE
-  # matcher group. Reinstall must surgically remove only our entry and
-  # keep the sibling, not blow away the entire group.
-  local our_cmd
-  our_cmd="$(cd "$repo_root" && pwd -P)/adapters/codex-cli/hooks/surface-handoffs.sh"
-  cat > "$HOME/.codex/hooks.json" <<EOF
-{
-  "hooks": {
-    "SessionStart": [
-      {"hooks": [
-        {"type":"command","command":"/usr/local/bin/sibling-hook"},
-        {"type":"command","command":"$our_cmd"}
-      ]}
-    ]
-  }
-}
-EOF
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  local sibling_kept
-  sibling_kept="$(jq '[.hooks.SessionStart[]?.hooks[]?
-                       | select(.command == "/usr/local/bin/sibling-hook")]
-                     | length' "$HOME/.codex/hooks.json")"
-  assert_eq "$sibling_kept" "1" "sibling hook preserved after surgical removal"
-  local our_count
-  our_count="$(jq --arg c "$our_cmd" '[.hooks.SessionStart[]?.hooks[]?
-                                       | select(.command == $c)] | length' \
-              "$HOME/.codex/hooks.json")"
-  assert_eq "$our_count" "1" "our entry present exactly once after reinstall"
-}
-
-test_install_into_project_preserves_other_hooks() {
-  if ! command -v jq >/dev/null 2>&1; then
-    printf '   skipping: jq not available\n' >&2; return 0
-  fi
-  local project="$AGENT_HANDOFF_ROOT/_proj"
-  mkdir -p "$project"
-  mkdir -p "$HOME/.codex"
-  # Seed an existing unrelated hook the install must preserve.
-  cat > "$HOME/.codex/hooks.json" <<'EOF'
-{
-  "hooks": {
-    "PreToolUse": [
-      {"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/existing-hook"}]}
-    ],
-    "SessionStart": [
-      {"hooks":[{"type":"command","command":"/usr/local/bin/existing-session-hook"}]}
-    ]
-  }
-}
-EOF
-  "$repo_root/bin/install-into-project" "$project" >/dev/null
-  local preserved
-  preserved="$(jq -r '.hooks.PreToolUse[0].hooks[0].command' "$HOME/.codex/hooks.json")"
-  assert_eq "$preserved" "/usr/local/bin/existing-hook" "PreToolUse preserved"
-  local kept_session
-  kept_session="$(jq '[.hooks.SessionStart[]?.hooks[]?
-                       | select(.command == "/usr/local/bin/existing-session-hook")]
-                     | length' "$HOME/.codex/hooks.json")"
-  assert_eq "$kept_session" "1" "existing SessionStart entry kept alongside agent-handoff"
+test_install_is_idempotent_for_symlinks() {
+  "$repo_root/bin/install" >/dev/null
+  "$repo_root/bin/install" >/dev/null
+  "$repo_root/bin/install" >/dev/null
+  local skill_target plugin_target
+  skill_target="$(readlink "$HOME/.claude/skills/handoff")"
+  plugin_target="$(readlink "$HOME/.codex/plugins/agent-handoff")"
+  assert_eq "$skill_target" "$repo_root/adapters/claude-code/skill" "skill symlink stable after 3 installs"
+  assert_eq "$plugin_target" "$repo_root/adapters/codex-cli" "codex plugin symlink stable after 3 installs"
 }
 
 ###############################################################################
@@ -1164,14 +1166,16 @@ tests=(
   test_print_body_warns_and_dumps_when_frontmatter_unclosed
   test_print_body_warns_on_empty_file
   test_surface_all_surfaces_malformed_with_warning
-  test_install_into_project_writes_correct_codex_format
-  test_install_into_project_writes_correct_claude_code_format
-  test_install_into_project_migrates_flat_claude_code_session_start
-  test_install_into_project_wraps_unrelated_flat_claude_code_entries
-  test_install_into_project_is_idempotent
-  test_install_into_project_migrates_stale_top_level_session_start
-  test_install_into_project_preserves_sibling_hook_in_same_group
-  test_install_into_project_preserves_other_hooks
+  test_install_writes_correct_claude_code_format
+  test_install_writes_correct_codex_format
+  test_install_is_idempotent
+  test_install_preserves_unrelated_hooks
+  test_install_migrates_flat_claude_code_entry
+  test_install_migrates_stale_top_level_codex_session_start
+  test_install_wraps_unrelated_flat_claude_code_entries
+  test_install_creates_skill_symlink
+  test_install_creates_codex_plugin_symlink
+  test_install_is_idempotent_for_symlinks
 )
 
 printf '=== agent-handoff tests ===\n'

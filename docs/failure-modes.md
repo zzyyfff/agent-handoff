@@ -137,11 +137,41 @@ silently skipped by the losing hook (the winner still surfaces it
 exactly once). `list_unread` skips dotfiles, so a parallel hook does
 not re-list a claimed file.
 
-**Stuck claim.** If a hook is killed (`SIGKILL`, panic) between claiming
-a file and finishing the archive, the file remains as
-`unread/.claim-<dead-pid>-<basename>` and is invisible to subsequent
-hooks. Recovery is manual: `mv unread/.claim-<pid>-<base> unread/<base>`
-or move it to `read/<base>` if already internalised.
+**Stuck claim — auto-recovered.** If a hook is killed (`SIGPIPE` from a
+stdout reader that closed early, e.g. `surface-handoffs.sh | head -10`;
+`SIGKILL`; panic mid-archive) between claiming a file and finishing
+the archive, the file would otherwise remain as
+`unread/.claim-<dead-pid>-<basename>` and be invisible to subsequent
+hooks (because `list_unread` skips dotfiles, by design, for race-safety
+against sibling hooks). The handoff would be silently lost until manual
+cleanup.
+
+Two automatic recovery layers protect against this:
+
+1. **Recovery sweep on entry.** Every `agent_handoff_surface_all` call
+   first scans `unread/` for `.claim-<pid>-*` files. For each, it
+   probes the PID with `kill -0`. If the PID is no longer a live
+   process, the file is renamed back to its original basename (the
+   `.claim-<pid>-` prefix is dropped). The restored file is then
+   picked up by the normal surface flow in the same invocation. Live
+   PIDs are left alone — a sibling hook may still be working on them.
+
+2. **Trap-based self-heal on exit.** During the surface loop, an
+   `EXIT` trap is installed that walks any still-claimed files this
+   invocation owns and renames them back to their originals. As each
+   file successfully archives, its slot in the pending-claims array is
+   cleared, so on clean completion the trap is a no-op. If the hook is
+   killed mid-loop, the trap fires during shell teardown and restores
+   whatever is left.
+
+Together, these mean a single crash never permanently loses a handoff:
+the dying hook self-heals on the way out, and any claim that somehow
+escapes that path (e.g. SIGKILL where no trap runs at all) is recovered
+by the next hook's entry sweep.
+
+Manual recovery is still possible if needed:
+`mv unread/.claim-<pid>-<base> unread/<base>` — or move it to
+`read/<base>` if already internalised.
 
 ## Recipient path traversal
 

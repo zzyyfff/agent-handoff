@@ -528,19 +528,136 @@ test_surface_all_strips_ansi_in_field() {
   fi
 }
 
-test_surface_all_skips_preclaimed_file() {
-  # Simulates a sibling hook that has already claimed the file: the
-  # current hook's mv will fail and the file should be silently skipped.
+test_surface_all_skips_live_preclaimed_file() {
+  # Simulates a sibling hook that has already claimed the file AND is
+  # still alive (PID maps to a live process): the current hook's
+  # recovery sweep must leave it alone, and list_unread skips dotfiles,
+  # so the file should be silently untouched.
   setup_fake_worktree assistant
   agent_handoff_ensure_inbox _fake assistant
-  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-99999-foo.md"
+  # $$ inside this subshell is the running test shell — guaranteed live
+  # for the duration of the test (vs the original test's hardcoded
+  # 99999, which is almost always dead and would now be recovered by
+  # the stale-claim sweep).
+  local live_pid=$$
+  local pre="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-${live_pid}-foo.md"
   write_sample_handoff "$pre"
   local out
   out="$(agent_handoff_surface_all 1 2>&1)"
-  # Dotfiles are not listed in the first place, so output should be empty
-  # and the pre-claimed file untouched.
-  assert_eq "$out" "" "pre-claimed dotfile not surfaced"
+  # Dotfiles are not listed in the first place, and the sweep saw the
+  # PID is alive — so output should be empty and the claim untouched.
+  assert_eq "$out" "" "live pre-claimed dotfile not surfaced"
   assert_file_exists "$pre"
+}
+
+test_surface_all_recovers_stale_claim_from_dead_pid() {
+  # A claim file left over from a hook that died (SIGPIPE, SIGKILL,
+  # panic) before it could archive must be recovered and surfaced.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  # Grab a guaranteed-dead PID: spawn a sleep 0 in the background, wait
+  # for it to exit, then reuse its PID. PID reuse is technically
+  # possible but extremely unlikely in the millisecond-scale window of
+  # a unit test.
+  local dead_pid
+  ( sleep 0 ) &
+  dead_pid=$!
+  wait "$dead_pid" 2>/dev/null || true
+  # Belt-and-suspenders: confirm it's actually dead before we rely on it.
+  if kill -0 "$dead_pid" 2>/dev/null; then
+    printf '   sleep 0 still alive at pid %d — flaky env?\n' "$dead_pid" >&2
+    exit 1
+  fi
+  local orig_name="20260516T100000Z-from-sender.md"
+  local stuck="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-${dead_pid}-${orig_name}"
+  write_sample_handoff "$stuck"
+
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+
+  # The stuck file is gone from unread/ (under both names).
+  if [[ -e "$stuck" ]]; then
+    printf '   stale claim should have been swept: %s\n' "$stuck" >&2
+    exit 1
+  fi
+  if [[ -e "$AGENT_HANDOFF_ROOT/_fake/assistant/unread/$orig_name" ]]; then
+    printf '   recovered file should also be archived, not lingering in unread\n' >&2
+    exit 1
+  fi
+  # The handoff was surfaced.
+  assert_contains "$out" "Test handoff" "recovered handoff was surfaced"
+  assert_contains "$out" "1 UNTRUSTED handoff(s) for assistant" "header counts the recovered file"
+  # It landed in read/ under its original name.
+  local archived="$AGENT_HANDOFF_ROOT/_fake/assistant/read/$orig_name"
+  assert_file_exists "$archived"
+  # received_at was stamped.
+  local rcv
+  rcv="$(agent_handoff_read_frontmatter_field "$archived" received_at)"
+  if [[ -z "$rcv" ]]; then
+    printf '   received_at not stamped on recovered file\n' >&2
+    exit 1
+  fi
+}
+
+test_surface_all_self_heals_after_interrupted_loop() {
+  # If THIS hook gets killed mid-loop (e.g. SIGPIPE from a stdout
+  # reader that closed early — see the live `… | head -10` hit), the
+  # trap-based unwind must restore any not-yet-archived claims back to
+  # their original names in unread/. So when the next hook runs, the
+  # handoff is still there.
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local unread_dir="$AGENT_HANDOFF_ROOT/_fake/assistant/unread"
+  local f1="$unread_dir/20260516T100000Z-from-sender-aaa.md"
+  local f2="$unread_dir/20260516T100001Z-from-sender-bbb.md"
+  write_sample_handoff "$f1"
+  write_sample_handoff "$f2"
+
+  # Monkey-patch one of the inner helpers to die on the SECOND call.
+  # Counter is module-scoped to this subshell.
+  agent_handoff_stamp_received_at_call_count=0
+  agent_handoff_stamp_received_at() {
+    agent_handoff_stamp_received_at_call_count=$((agent_handoff_stamp_received_at_call_count + 1))
+    if [[ "$agent_handoff_stamp_received_at_call_count" -ge 2 ]]; then
+      # Simulate hook being killed mid-loop. `exit 1` from inside the
+      # function exits the surrounding subshell, which is what
+      # SIGPIPE/SIGKILL ultimately does.
+      exit 1
+    fi
+    # First call: behave normally (touch the file to keep the rest of
+    # the archive path happy if it gets there).
+    return 0
+  }
+
+  # Run in a subshell so the simulated kill does not abort the test
+  # harness. Expect non-zero status.
+  if ( agent_handoff_surface_all 1 >/dev/null 2>&1 ); then
+    printf '   expected surface_all to fail under simulated kill\n' >&2
+    exit 1
+  fi
+
+  # After the trap fires, no `.claim-*` files should remain in unread/.
+  shopt -s nullglob
+  local leftover=("$unread_dir"/.claim-*)
+  shopt -u nullglob
+  if [[ ${#leftover[@]} -gt 0 ]]; then
+    printf '   trap failed to restore claims: %s\n' "${leftover[*]}" >&2
+    exit 1
+  fi
+
+  # At least one of the original files must be back under its original
+  # name. (One may have been archived to read/ before the kill — that
+  # is fine; the point is no stuck claims are left behind.)
+  local restored_count=0
+  [[ -e "$f1" ]] && restored_count=$((restored_count + 1))
+  [[ -e "$f2" ]] && restored_count=$((restored_count + 1))
+  shopt -s nullglob
+  local archived=("$AGENT_HANDOFF_ROOT/_fake/assistant/read"/*.md)
+  shopt -u nullglob
+  local total=$((restored_count + ${#archived[@]}))
+  # Every handoff should be accounted for — either back in unread/ or
+  # archived in read/. None can be stuck as a claim.
+  assert_eq "$total" "2" "every handoff is either restored to unread/ or archived to read/"
 }
 
 ###############################################################################
@@ -960,7 +1077,9 @@ tests=(
   test_list_unread_skips_symlinks
   test_surface_all_strips_ansi_in_body
   test_surface_all_strips_ansi_in_field
-  test_surface_all_skips_preclaimed_file
+  test_surface_all_skips_live_preclaimed_file
+  test_surface_all_recovers_stale_claim_from_dead_pid
+  test_surface_all_self_heals_after_interrupted_loop
   test_atomic_write_returns_landing_path
   test_atomic_write_collision_appends_hex_suffix
   test_atomic_write_does_not_overwrite_via_helper

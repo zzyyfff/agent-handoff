@@ -334,6 +334,14 @@ agent_handoff_recover_stale_claims() {
       ''|*[!0-9]*) continue ;;
     esac
     agent_handoff_validate_basename "$orig" 2>/dev/null || continue
+    # Reject all-zero PIDs (`0`, `00`, ...) before the liveness check.
+    # `kill -0 0` is a POSIX special case: it signals the entire
+    # process group, always succeeds, and would otherwise make a
+    # `.claim-0-foo.md` file stick in unread/ forever.
+    case "$pid" in
+      *[!0]*) ;;        # at least one non-zero digit, normal PID
+      *) continue ;;    # all zeros — never a real owner, skip recovery
+    esac
     # Liveness check: if the PID is still a live process, a sibling
     # hook may still be working on the file — leave it alone. Note
     # that containers, devcontainers, and some CI environments hand

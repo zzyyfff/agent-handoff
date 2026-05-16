@@ -599,6 +599,30 @@ test_surface_all_recovers_stale_claim_from_dead_pid() {
   fi
 }
 
+test_surface_all_skips_pid_zero_claim() {
+  # `.claim-0-<orig>.md` would otherwise stick forever: `kill -0 0`
+  # signals the entire process group and always succeeds, so the
+  # sweep would treat PID 0 as "live" indefinitely. We special-case
+  # all-zero PIDs and skip recovery for them.
+  #
+  # No real hook ever owns PID 0, so the file is unrecoverable
+  # automatically — leaving it in place lets a human notice and
+  # decide what to do (likely a hand-edited or malicious file).
+  setup_fake_worktree assistant
+  agent_handoff_ensure_inbox _fake assistant
+  local orig_name="20260516T100000Z-from-sender.md"
+  local stuck="$AGENT_HANDOFF_ROOT/_fake/assistant/unread/.claim-0-${orig_name}"
+  write_sample_handoff "$stuck"
+
+  local out
+  out="$(agent_handoff_surface_all 1 2>&1)"
+
+  # File still in unread/ under the .claim-0- name (not recovered).
+  assert_file_exists "$stuck"
+  # Nothing surfaced (the file remained a dotfile and was not picked up).
+  assert_eq "$out" "" "no output when only a .claim-0-* file exists"
+}
+
 test_surface_all_does_not_clobber_caller_exit_trap() {
   # surface_all no longer installs an EXIT trap (the in-process
   # self-heal was removed — recovery is handled by the next-invocation
@@ -1129,6 +1153,7 @@ tests=(
   test_surface_all_strips_ansi_in_field
   test_surface_all_skips_live_preclaimed_file
   test_surface_all_recovers_stale_claim_from_dead_pid
+  test_surface_all_skips_pid_zero_claim
   test_surface_all_leaves_stuck_claim_for_next_sweep_to_recover
   test_surface_all_does_not_clobber_caller_exit_trap
   test_atomic_write_returns_landing_path
